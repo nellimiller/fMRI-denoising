@@ -6,7 +6,7 @@ from models.patch_embed import fMRIPatchEmbed4D
 from utils.masking import apply_swin_mask
 
 import torch
-from models.mae_core import SwinMAE
+from models.mae_core import HierarchicalSwinMAE as SwinMAE
 
 def run_end_to_end_test():
     print("Initializing dummy fMRI tensor [Batch=1, Ch=4, T=2, X=210, Y=210, Z=114]...")
@@ -23,9 +23,9 @@ def run_end_to_end_test():
     print(f"Original Input Shape: {dummy_fmri.shape}")
     print(f"Reconstructed Shape: {reconstruction.shape}")
     
-    # The reconstruction will be padded to Z=126. We need to slice it back to Z=114 
-    # to calculate the loss against the original input.
-    final_output = reconstruction[..., :114]
+    # The reconstruction will be padded to Z=126 -> slice it back to Z=114 
+    # Dimensions: [Batch, Channel, Time, X, Y, Z]
+    final_output = reconstruction[:, :, :, :210, :210, :114]
     
     print(f"Cropped Output Shape (Ready for Loss): {final_output.shape}")
 

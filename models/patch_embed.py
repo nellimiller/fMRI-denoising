@@ -13,10 +13,13 @@ from einops import rearrange
 # Embedding dimension: Size of the latent token vector. Higher values capture more complex features but increase computational load.
 
 class fMRIPatchEmbed4D(nn.Module):
-    def __init__(self, patch_size=14, in_chans=4, embed_dim=96):
+    def __init__(self, patch_size=14, in_chans=4, embed_dim=96, merge_stages=3):
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
+
+        # Calculate required grid multiple
+        self.grid_multiple = 2 ** merge_stages 
 
         # 3D convolution to convert spatial patches into latent tokens
         self.proj = nn.Conv3d(
@@ -30,26 +33,36 @@ class fMRIPatchEmbed4D(nn.Module):
         # Input: [Batch, Channels, Time, Height, Width, Depth]
         B, C, T, H, W, D = x.shape
         P = self.patch_size
+        M = self.grid_multiple
 
-        # Calculate padding to ensure divisibility by patch size
-        pad_h = (P - H % P) % P
-        pad_w = (P - W % P) % P
-        pad_d = (P - D % P) % P
+        # Calculate the absolute minimum patches needed without cropping
+        min_h = (H + P - 1) // P
+        min_w = (W + P - 1) // P
+        min_d = (D + P - 1) // P
 
-        # Apply padding (right-to-left: back, front, bottom, top, left, right)
-        if pad_h > 0 or pad_w > 0 or pad_d > 0:
-            x = F.pad(x, (0, pad_d, 0, pad_w, 0, pad_h))
+        # Round up to the nearest multiple of M
+        target_h_patches = ((min_h + M - 1) // M) * M
+        target_w_patches = ((min_w + M - 1) // M) * M
+        target_d_patches = ((min_d + M - 1) // M) * M
 
+        # Calculate target voxel dimensions
+        target_h = target_h_patches * P
+        target_w = target_w_patches * P
+        target_d = target_d_patches * P
+
+        # Calculate padding required to hit those targets
+        pad_h = target_h - H
+        pad_w = target_w - W
+        pad_d = target_d - D
+
+        # Apply padding
+        x = F.pad(x, (0, pad_d, 0, pad_w, 0, pad_h))
         _, _, _, H_pad, W_pad, D_pad = x.shape
 
-        # Temporarily collapse Batch and Time to process through standard Conv3d
         x = rearrange(x, 'b c t h w d -> (b t) c h w d')
-        x = self.proj(x)  # [B*T, embed_dim, H_pad/P, W_pad/P, D_pad/P]
-
-        # Flatten spatial patches into 1D sequence line
-        # Output: [Batch, (Time * H_patches * W_patches * D_patches), embed_dim]
+        x = self.proj(x) 
+        
         x = rearrange(x, '(b t) e hp wp dp -> b (t hp wp dp) e', b=B, t=T)
         
-        # Return tokens and padded grid dimensions for positional embeddings later
         spatial_grid = (H_pad // P, W_pad // P, D_pad // P)
         return x, spatial_grid
