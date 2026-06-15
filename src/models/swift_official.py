@@ -1,3 +1,5 @@
+# This file is part of the code for the SwiFT Architecture available at https://github.com/Transconnectome/SwiFT
+
 """
 Our code is based on the following code.
 https://docs.monai.io/en/stable/_modules/monai/networks/nets/swin_unetr.html#SwinUNETR

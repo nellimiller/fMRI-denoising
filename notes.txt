@@ -1,0 +1,6 @@
+Notizen:
+
+nächste Schritte stand 15.06.2026:
+
+    - training infrastructure mit lightning erstellen
+    - w&b training file erstellen
