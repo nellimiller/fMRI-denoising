@@ -5,11 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "dicom2nifti>=2.6.2",
     "einops>=0.8.2",
     "lightning>=2.6.5",
     "monai>=1.5.2",
     "nibabel>=5.4.2",
     "nilearn>=0.13.1",
+    "nipype>=1.11.0",
+    "numpy>=2.4.6",
     "pytorch-lightning>=2.6.5",
     "torch>=2.12.0",
     "torchaudio>=2.11.0",

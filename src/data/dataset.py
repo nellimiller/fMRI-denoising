@@ -11,7 +11,7 @@ from einops import repeat
 class fMRIDataset(Dataset):
     def __init__(self, data_dir, time_frames=40):
         """
-        Expects a standard neuroimaging directory structure:
+        Expects a neuroimaging directory of following structure:
         data_dir/
             sub-01/
                 bold.nii.gz
