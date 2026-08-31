@@ -16,15 +16,25 @@ def run_pipeline_test():
     
     # 3. Forward Pass
     print("Running forward pass...")
-    reconstruction, mask = model(dummy_fmri, tube_masking=True)
-    
+    reconstruction, clean_pred, noise_pred, mask = model(dummy_fmri, tube_masking=True, return_heads=True)
+
     # Cropping the padding off the reconstruction to match the raw target
-    #final_output = reconstruction[:, :, :, :210, :210, :114]
     final_output = reconstruction[:, :, :, :42, :42, :28]
-    
+    clean_cropped = clean_pred[:, :, :, :42, :42, :28]
+    noise_cropped = noise_pred[:, :, :, :42, :42, :28]
+
     # 4. Calculating Loss
-    print("Calculating Masked MSE and FFT Loss...")
-    total_loss, mse, fft = loss_fn(pred=final_output, target=dummy_fmri, mask=mask)
+    print("Calculating structural decomposition loss...")
+    total_loss, mse, fft = loss_fn(
+        pred=final_output,
+        target=dummy_fmri,
+        mask=mask,
+        clean_pred=clean_cropped,
+        noise_pred=noise_cropped,
+        gm_mask=dummy_fmri[:, 1:2],
+        wm_mask=dummy_fmri[:, 2:3],
+        csf_mask=dummy_fmri[:, 3:4],
+    )
     
     print(f"\n--- Loss Output ---")
     print(f"Masked MSE Loss: {mse.item():.4f}")
