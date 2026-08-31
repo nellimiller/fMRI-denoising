@@ -1,5 +1,24 @@
-# fMRI-denoising
+fMRI-denoising
 Deep Learning-Based Denoising of Ultra-High-Field 7 Tesla Functional Magnetic Resonance Imaging Data
+
+## Proposed Architecture: Structural Masked Autoencoder for 7T fMRI
+
+This project implements a 4D fMRI masked autoencoder baseline based on the SWIFT/Swin Transformer family and extends it with an additive decomposition objective for denoising.
+
+The encoder is trained as an unsupervised masked autoencoder, while the decoder splits its output into two heads:
+
+- `Y_clean`: the denoised neural/BOLD component in grey matter
+- `Y_noise`: physiological and scanner-related nuisance signal routed to CSF/WM
+
+The total reconstruction satisfies:
+
+Y_total = Y_clean + Y_noise
+
+The training objective follows the structural decomposition described in the project notes:
+
+L_total = L_recon + lambda_1 L_flat + lambda_2 L_ortho
+
+`L_flat` is computed as temporal variance over time for voxels in WM/CSF for the clean branch, and `L_ortho` is implemented as a deep aCompCor-style summary penalty: a single temporal noise vector averaged over WM/CSF is projected against each GM voxel time series, avoiding the memory-heavy token-to-token covariance matrix. This keeps the model fully self-supervised while remaining computationally stable for high-resolution 7T data. The first implementation targets the Natural Scenes Dataset and uses anatomical masks derived from the structural scan (GM, WM, CSF) to build spatiotemporal masking and penalty terms.
 
 ## Directory Hierarchy
 
