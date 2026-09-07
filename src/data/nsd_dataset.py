@@ -1,178 +1,192 @@
+"""Manifest-backed Natural Scenes Dataset loader.
+
+The NSD preprocessing step writes one ``manifest.json`` per subject. Each
+manifest entry identifies a BOLD run and a temporal window. This loader
+returns one window as ``[4, T, X, Y, Z]``:
+
+    channel 0: normalized BOLD
+    channel 1: GM mask
+    channel 2: WM mask
+    channel 3: CSF mask
 """
-NSD Dataset loader
 
-This Dataset expects a directory with subject subfolders. Each subject folder should contain:
-- one or more 4D BOLD NIfTI files (e.g. *_bold.nii.gz or bold.nii.gz)
-- corresponding anatomical masks (gm.nii.gz, wm.nii.gz, csf.nii.gz) located either in the same subject folder or in an `anat/` subfolder
-
-Return format (torch.Tensor):
-- final_tensor: shape [4, T, X, Y, Z]
-  channel 0: BOLD (T, X, Y, Z)
-  channel 1: GM mask (T, X, Y, Z)
-  channel 2: WM mask (T, X, Y, Z)
-  channel 3: CSF mask (T, X, Y, Z)
-
-The loader will z-score normalize the BOLD volume globally, pad/truncate to `time_frames` and duplicate static masks across time.
-
-Usage:
-    from data.nsd_dataset import NSDDataset
-    ds = NSDDataset('/path/to/nsd_root', time_frames=40)
-
-"""
 from __future__ import annotations
 
-import os
-import fnmatch
-from typing import List, Optional, Tuple
+import json
+from pathlib import Path
+from typing import Any, Optional, Sequence
 
-import numpy as np
 import nibabel as nib
+import numpy as np
 import torch
-from torch.utils.data import Dataset
 from einops import repeat
-
-
-def _find_file(folder: str, patterns: List[str]) -> Optional[str]:
-    for root, _, files in os.walk(folder):
-        for p in patterns:
-            for f in fnmatch.filter(files, p):
-                return os.path.join(root, f)
-    return None
+from torch.utils.data import Dataset
 
 
 class NSDDataset(Dataset):
+    """Load temporal windows described by NSD preprocessing manifests."""
+
     def __init__(
         self,
-        nsd_root: str,
-        subjects: Optional[List[str]] = None,
-        time_frames: int = 40,
-        bold_patterns: Optional[List[str]] = None,
-        gm_name: str = "gm.nii.gz",
-        wm_name: str = "wm.nii.gz",
-        csf_name: str = "csf.nii.gz",
-    ):
-        """Create an NSD-style dataset.
+        nsd_root: str | Path,
+        subjects: Optional[Sequence[str]] = None,
+        time_frames: Optional[int] = 40,
+        normalize_per_window: bool = True,
+        crop_size: Optional[tuple[int, int, int]] = None,
+    ) -> None:
+        self.nsd_root = Path(nsd_root)
+        self.time_frames = time_frames
+        self.normalize_per_window = normalize_per_window
+        self.crop_size = crop_size
+        if not self.nsd_root.is_dir():
+            raise FileNotFoundError(f"NSD processed root does not exist: {self.nsd_root}")
 
-        Args:
-            nsd_root: root folder containing subject subfolders
-            subjects: optional list of subject folder names to include. If None, all directories are used.
-            time_frames: enforced temporal length (pads or truncates to this length)
-            bold_patterns: list of glob patterns to match bold files (default tries common names)
-            gm_name/wm_name/csf_name: expected mask filenames (searched recursively under the subject folder)
-        """
-        self.nsd_root = nsd_root
-        self.time_frames = int(time_frames)
+        requested = set(subjects) if subjects is not None else None
+        self.entries: list[dict[str, Any]] = []
+        manifest_paths = sorted(self.nsd_root.glob("*/manifest.json"))
+        if not manifest_paths:
+            raise FileNotFoundError(
+                f"No subject manifests found under {self.nsd_root}. "
+                "Run data_preprocessing.nsd.preprocess first."
+            )
 
-        if bold_patterns is None:
-            self.bold_patterns = ["*bold*.nii.gz", "*bold*.nii", "*BOLD*.nii.gz"]
-        else:
-            self.bold_patterns = bold_patterns
+        for manifest_path in manifest_paths:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            subject = str(manifest.get("subject", manifest_path.parent.name))
+            if requested is not None and subject not in requested:
+                continue
+            manifest_window = int(manifest["window_length"])
+            for entry in manifest["entries"]:
+                item = dict(entry)
+                item["_manifest_window_length"] = manifest_window
+                item["_manifest_path"] = str(manifest_path)
+                self.entries.append(item)
 
-        if subjects is None:
-            # list directories only
-            self.subjects = [d for d in os.listdir(nsd_root) if os.path.isdir(os.path.join(nsd_root, d))]
-            self.subjects.sort()
-        else:
-            self.subjects = subjects
+        if not self.entries:
+            raise ValueError(f"No manifest entries found for subjects={subjects!r}")
 
-        self.gm_name = gm_name
-        self.wm_name = wm_name
-        self.csf_name = csf_name
-
-        if len(self.subjects) == 0:
-            raise ValueError(f"No subject folders found in {nsd_root}")
+        self._mask_cache: dict[tuple[str, str, str], np.ndarray] = {}
 
     def __len__(self) -> int:
-        return len(self.subjects)
+        return len(self.entries)
 
-    def _load_nifti(self, path: str) -> np.ndarray:
-        img = nib.load(path)
-        data = img.get_fdata(dtype=np.float32)
-        return data
+    @staticmethod
+    def _load_image(path: Path) -> nib.Nifti1Image:
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing NIfTI file referenced by manifest: {path}")
+        return nib.load(str(path))
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        subject_folder = os.path.join(self.nsd_root, self.subjects[idx])
+    @staticmethod
+    def _validate_spatial_geometry(
+        bold_image: nib.Nifti1Image,
+        mask_image: nib.Nifti1Image,
+        mask_name: str,
+    ) -> None:
+        if bold_image.shape[:3] != mask_image.shape[:3]:
+            raise ValueError(
+                f"{mask_name} shape {mask_image.shape[:3]} does not match "
+                f"BOLD shape {bold_image.shape[:3]}"
+            )
+        if not np.allclose(bold_image.affine, mask_image.affine, atol=1e-4):
+            raise ValueError(f"{mask_name} affine does not match the BOLD affine")
 
-        # 1) Find a bold file
-        bold_path = _find_file(subject_folder, self.bold_patterns)
-        if bold_path is None:
-            raise FileNotFoundError(f"No BOLD file found under subject {subject_folder} with patterns {self.bold_patterns}")
+    def _load_mask(
+        self,
+        path: Path,
+        bold_image: nib.Nifti1Image,
+        mask_name: str,
+    ) -> np.ndarray:
+        cache_key = (str(path), mask_name, str(tuple(bold_image.shape[:3])))
+        if cache_key not in self._mask_cache:
+            image = self._load_image(path)
+            self._validate_spatial_geometry(bold_image, image, mask_name)
+            data = image.get_fdata(dtype=np.float32)
+            if data.ndim != 3:
+                raise ValueError(f"{mask_name} must be 3D, got shape {data.shape}")
+            self._mask_cache[cache_key] = (data > 0).astype(np.float32)
+        return self._mask_cache[cache_key]
 
-        bold_data = self._load_nifti(bold_path)  # shape [X, Y, Z, T] or [T, X, Y, Z]
+    def __getitem__(self, index: int) -> torch.Tensor:
+        entry = self.entries[index]
+        bold_image = self._load_image(Path(entry["bold_path"]))
+        if len(bold_image.shape) != 4:
+            raise ValueError(f"BOLD run must be 4D, got shape {bold_image.shape}")
 
-        # Normalize orientation: ensure time is axis 3 if nibabel returned (X,Y,Z,T)
-        if bold_data.ndim == 4 and bold_data.shape[3] >= 2:
-            # assume shape [X, Y, Z, T]
-            bold_data = np.transpose(bold_data, (3, 0, 1, 2))
-        elif bold_data.ndim != 4:
-            raise ValueError(f"Unsupported BOLD nifti shape: {bold_data.shape}")
+        start = int(entry["start"])
+        stop = int(entry["stop"])
+        available = int(bold_image.shape[3])
+        if start < 0 or stop > available or start >= stop:
+            raise IndexError(
+                f"Invalid temporal window [{start}, {stop}) for BOLD run with {available} frames"
+            )
 
-        # Global z-score normalize the entire 4D volume
-        mean = np.mean(bold_data)
-        std = np.std(bold_data) + 1e-8
-        bold_data = (bold_data - mean) / std
+        bold_data = bold_image.slicer[:, :, :, start:stop].get_fdata(dtype=np.float32)
+        if self.time_frames is not None and bold_data.shape[3] != self.time_frames:
+            raise ValueError(
+                f"Manifest window has {bold_data.shape[3]} frames, expected {self.time_frames}"
+            )
+        if not np.isfinite(bold_data).all():
+            raise ValueError(f"BOLD window contains non-finite values: {entry['bold_path']}")
 
-        # Enforce temporal length
-        if bold_data.shape[0] >= self.time_frames:
-            bold_data = bold_data[: self.time_frames]
+        if self.normalize_per_window:
+            mean = float(bold_data.mean())
+            std = float(bold_data.std())
+            bold_data = (bold_data - mean) / max(std, 1e-8)
+
+        gm = self._load_mask(Path(entry["gm_path"]), bold_image, "GM mask")
+        wm = self._load_mask(Path(entry["wm_path"]), bold_image, "WM mask")
+        csf = self._load_mask(Path(entry["csf_path"]), bold_image, "CSF mask")
+
+        bold_time_first = np.transpose(bold_data, (3, 0, 1, 2))
+        masks = np.stack([gm, wm, csf], axis=0)
+        if self.crop_size is not None:
+            bold_time_first, masks = self._center_crop(
+                bold_time_first, masks, self.crop_size
+            )
+        masks_time = repeat(masks, "c x y z -> c t x y z", t=bold_time_first.shape[0])
+        return torch.from_numpy(
+            np.concatenate([bold_time_first[None, ...], masks_time], axis=0).astype(np.float32)
+        )
+
+    @staticmethod
+    def _center_crop(
+        bold: np.ndarray,
+        masks: np.ndarray,
+        crop_size: tuple[int, int, int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Crop around the union of tissue masks, padding when needed."""
+        if len(crop_size) != 3 or any(size <= 0 for size in crop_size):
+            raise ValueError("crop_size must contain three positive dimensions")
+
+        spatial_shape = np.asarray(masks.shape[1:], dtype=int)
+        requested = np.asarray(crop_size, dtype=int)
+        if np.any(requested > spatial_shape):
+            raise ValueError(
+                f"crop_size {tuple(requested)} exceeds volume shape "
+                f"{tuple(spatial_shape)}"
+            )
+
+        tissue = masks.max(axis=0) > 0
+        coordinates = np.argwhere(tissue)
+        if coordinates.size:
+            center = coordinates.mean(axis=0).round().astype(int)
         else:
-            pad_len = self.time_frames - bold_data.shape[0]
-            bold_data = np.pad(bold_data, ((0, pad_len), (0, 0), (0, 0), (0, 0)), mode="constant", constant_values=0.0)
+            center = spatial_shape // 2
 
-        # 2) Find anatomical masks (try anat/ first then anywhere under subject)
-        gm_path = _find_file(subject_folder, [self.gm_name])
-        wm_path = _find_file(subject_folder, [self.wm_name])
-        csf_path = _find_file(subject_folder, [self.csf_name])
-
-        if gm_path is None or wm_path is None or csf_path is None:
-            # if any mask missing, still allow but create empty masks with zeros and warn
-            missing = [name for name, p in [("GM", gm_path), ("WM", wm_path), ("CSF", csf_path)] if p is None]
-            print(f"Warning: missing masks for subject {self.subjects[idx]}: {missing}. Using zeros for missing masks.")
-
-        def _maybe_load_mask(p, exemplar_shape: Tuple[int, int, int]):
-            if p is None:
-                return np.zeros(exemplar_shape, dtype=np.float32)
-            data = np.asarray(nib.load(p).get_fdata(dtype=np.float32))
-            # if mask has different orientation, attempt to reshape or crop/pad
-            if data.shape != exemplar_shape:
-                # try transpose if time dimension present
-                if data.ndim == 4:
-                    data = np.squeeze(data)
-                # naive crop/pad to exemplar
-                out = np.zeros(exemplar_shape, dtype=np.float32)
-                minx = min(out.shape[0], data.shape[0])
-                miny = min(out.shape[1], data.shape[1])
-                minz = min(out.shape[2], data.shape[2])
-                out[:minx, :miny, :minz] = data[:minx, :miny, :minz]
-                return out
-            return data
-
-        exemplar_shape = bold_data.shape[1:4]
-        gm_data = _maybe_load_mask(gm_path, exemplar_shape)
-        wm_data = _maybe_load_mask(wm_path, exemplar_shape)
-        csf_data = _maybe_load_mask(csf_path, exemplar_shape)
-
-        # Stack and duplicate masks across time: [3, T, X, Y, Z]
-        masks_stacked = np.stack([gm_data, wm_data, csf_data], axis=0)
-        masks_time = repeat(masks_stacked, "c x y z -> c t x y z", t=self.time_frames)
-
-        # BOLD to tensor [1, T, X, Y, Z]
-        bold_tensor = torch.from_numpy(bold_data).unsqueeze(0)
-        masks_tensor = torch.from_numpy(masks_time)
-
-        final_tensor = torch.cat([bold_tensor, masks_tensor], dim=0)
-        # final_tensor shape: [4, T, X, Y, Z]
-
-        return final_tensor
+        start = center - requested // 2
+        start = np.maximum(start, 0)
+        start = np.minimum(start, spatial_shape - requested)
+        stop = start + requested
+        slices = tuple(slice(int(a), int(b)) for a, b in zip(start, stop))
+        return bold[(slice(None), *slices)], masks[(slice(None), *slices)]
 
 
 if __name__ == "__main__":
-    # simple smoke test when run directly
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("root", help="NSD root folder containing subject subfolders")
+    parser.add_argument("root", help="Processed NSD root containing subject manifests")
     args = parser.parse_args()
-
-    ds = NSDDataset(args.root, time_frames=40)
-    print(f"Found {len(ds)} subjects. Example element shapes: {ds[0].shape}")
+    dataset = NSDDataset(args.root)
+    print(f"Found {len(dataset)} temporal windows")
+    print(f"Example tensor shape: {tuple(dataset[0].shape)}")
