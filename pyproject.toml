@@ -8,6 +8,7 @@ dependencies = [
     "dicom2nifti>=2.6.2",
     "einops>=0.8.2",
     "lightning>=2.6.5",
+    "matplotlib>=3.10.0",
     "monai>=1.5.2",
     "nibabel>=5.4.2",
     "nilearn>=0.13.1",
