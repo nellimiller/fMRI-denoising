@@ -1,36 +1,62 @@
-### This file dynamically pads 4D volumes and slices them into token embeddings.
-### Ensures that the input dimensions are divisible by the patch size, allowing for seamless tokenization.
+"""Dynamic padding and tokenization of 4D fMRI volumes for Swin Transformers."""
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-# Channel size of 4 to solve physiological aliasing problem
-# Channel 1 = BOLD fMRI sequence, Channel 2 = Grey Matter spatial mask, Channel 3 = White Matter spatial mask, Channel 4 = CSF spatial mask
-
-# Patch size: 3D cube voxels grouped into single token. Reducing it -> saves GPU memory but lowers spatial resolution.
-# Embedding dimension: Size of the latent token vector. Higher values capture more complex features but increase computational load.
 
 class fMRIPatchEmbed4D(nn.Module):
-    def __init__(self, patch_size=14, in_chans=4, embed_dim=96, merge_stages=3):
+    """Slices 4D fMRI volumes into token embeddings with dynamic spatial padding.
+    
+    Ensures input dimensions are divisible by the patch size adn the downsampling
+    requirements of the hierarchical Swin Transformer stages.
+    
+    Args:
+        patch_size: 3D cube voxel dimension grouped into a single token.
+            Lower values increase spatial resolution but consume more GPU memory.
+        in_chans: Number of input channels. Defaults to 4 (1 BOLD sequence + 
+            3 spatial tissue masks: GM, WM, CSF) to mitigate physiological aliasing.
+        embed_dim: Size of the latent token vector.
+        merge_stages: Number of hierarchical downsampling stages in the network.
+    """
+
+    def __init__(
+        self,
+        patch_size: int = 14,
+        in_chans: int = 4,
+        embed_dim: int = 96,
+        merge_stages: int = 3
+    ) -> None:
+        """Initialize the spatial patch embedding projection."""
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
 
-        # Calculate required grid multiple
-        self.grid_multiple = 2 ** merge_stages 
+        # Calculate the required grid multiple to ensure dimensions survive pooling
+        self.grid_multiple = 2 ** merge_stages
 
-        # 3D convolution to convert spatial patches into latent tokens
+        # 3D convolution converts spatial patches directly into latent tokens
         self.proj = nn.Conv3d(
             in_channels=in_chans,
             out_channels=embed_dim,
             kernel_size=patch_size,
-            stride=patch_size
+            stride=patch_size,
         )
     
-    def forward(self, x):
-        # Input: [Batch, Channels, Time, Height, Width, Depth]
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
+        """Pad the 4D volume and project it into a flattened token sequence.
+
+        Args:
+            x: Input tensor of shape '(B, C, T, H, W, D)'.
+
+        Returns:
+            A tuple containing:
+            - The flattened token sequence `(B, L, E)`.
+            - The spatial grid dimensions `(H_p, W_p, D_p)` for later reshaping.
+        """
         B, C, T, H, W, D = x.shape
         P = self.patch_size
         M = self.grid_multiple
@@ -40,7 +66,7 @@ class fMRIPatchEmbed4D(nn.Module):
         min_w = (W + P - 1) // P
         min_d = (D + P - 1) // P
 
-        # Round up to the nearest multiple of M
+        # Round up to the nearest multiple of the hierarchical pooling stages
         target_h_patches = ((min_h + M - 1) // M) * M
         target_w_patches = ((min_w + M - 1) // M) * M
         target_d_patches = ((min_d + M - 1) // M) * M
@@ -55,14 +81,17 @@ class fMRIPatchEmbed4D(nn.Module):
         pad_w = target_w - W
         pad_d = target_d - D
 
-        # Apply padding
+        # Apply spatial padding (starts from the last dimension: D, then W, then H)
         x = F.pad(x, (0, pad_d, 0, pad_w, 0, pad_h))
-        _, _, _, H_pad, W_pad, D_pad = x.shape
+        H_pad, W_pad, D_pad = x.shape[3:]
 
-        x = rearrange(x, 'b c t h w d -> (b t) c h w d')
+        # Merge Batch and Time for 3D spatial convolution
+        x = rearrange(x, "b c t h w d -> (b t) c h w d")
         x = self.proj(x) 
         
-        x = rearrange(x, '(b t) e hp wp dp -> b (t hp wp dp) e', b=B, t=T)
+        # Flatten spatial dimensions into a 1D token sequence and restore Batch
+        x = rearrange(x, "(b t) e hp wp dp -> b (t hp wp dp) e", b=B, t=T)
         
         spatial_grid = (H_pad // P, W_pad // P, D_pad // P)
+        
         return x, spatial_grid
