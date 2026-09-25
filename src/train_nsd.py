@@ -1,23 +1,20 @@
-"""
-Training script for Natural Scenes Dataset (NSD)
+"""Training script for the Natural Scenes Dataset (NSD) Masked Autoencoder.
 
 Run from the project root (recommended):
-    uv run python -m src.train_nsd --data_dir C:/path/to/nsd_root --batch_size 1 --epochs 100
+    uv run python -m src.train_nsd --data_dir "C:/path/to/nsd_root" --batch_size 1 --epochs 100
 
-If you prefer running from the src/ folder use:
-    uv run python train_nsd.py --data_dir C:/path/to/nsd_root
-
-The script constructs a Lightning DataModule that uses data.nsd_dataset.NSDDataset and trains the fMRIDenoisingLightning model.
+If running directly from the src/ folder:
+    uv run python train_nsd.py --data_dir "C:/path/to/nsd_root"
 """
+
 from __future__ import annotations
 
 import argparse
-import os
-from typing import Optional
+from pathlib import Path
 
 import lightning as L
-from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import WandbLogger
 from torch.utils.data import DataLoader, random_split
 
 from data.nsd_dataset import NSDDataset
@@ -25,26 +22,41 @@ from models.lightning_model import fMRIDenoisingLightning
 
 
 class NSDDataModule(L.LightningDataModule):
+    """LightningDataModule coordinating the loading and splitting of 4D fMRI tensors.
+
+    Args:
+        data_dir: Path to the preprocessed NSD root directory containing subject manifests.
+        batch_size: Number of temporal windows per batch. Defaults to 1 due to 4D tensor size.
+        time_frames: Sequence length (T) for the sliding window. Defaults to 40.
+        num_workers: Subprocesses for data loading.
+        val_split: Fraction of the dataset reserved for validation.
+        subjects: Optional list of specific subject IDs to load (e.g., ["subj01"]).
+    """
     def __init__(
         self,
-        data_dir: str,
+        data_dir: str | Path,
         batch_size: int = 1,
         time_frames: int = 40,
         num_workers: int = 4,
         val_split: float = 0.2,
-        subjects: Optional[list] = None,
-    ):
+        subjects: list[str] | None = None,
+    ) -> None:
+        """Initialize dataloader hyperparameters."""
         super().__init__()
-        self.data_dir = data_dir
+        self.data_dir = Path(data_dir)
         self.batch_size = batch_size
         self.time_frames = time_frames
         self.num_workers = num_workers
         self.val_split = val_split
         self.subjects = subjects
 
-    def setup(self, stage=None):
-        # Build the dataset
-        self.full_dataset = NSDDataset(self.data_dir, subjects=self.subjects, time_frames=self.time_frames)
+    def setup(self, stage: str | None = None) -> None:
+        """Parse JSON manifests and split the dataset into training and validation sets."""
+        self.full_dataset = NSDDataset(
+            self.data_dir,
+            subjects=self.subjects,
+            time_frames=self.time_frames
+        )
 
         total_len = len(self.full_dataset)
         if total_len == 0:
@@ -52,14 +64,16 @@ class NSDDataModule(L.LightningDataModule):
 
         val_len = int(total_len * self.val_split)
         train_len = total_len - val_len
+
+        # Guardrail for extremely small dataset testing
         if val_len == 0:
-            # ensure at least one validation example
             val_len = 1
             train_len = total_len - 1
 
         self.train_set, self.val_set = random_split(self.full_dataset, [train_len, val_len])
 
-    def train_dataloader(self):
+    def train_dataloader(self) -> DataLoader:
+        """Return the training DataLoader with pinned memory for fast GPU transfers."""
         return DataLoader(
             self.train_set,
             batch_size=self.batch_size,
@@ -68,7 +82,8 @@ class NSDDataModule(L.LightningDataModule):
             pin_memory=True,
         )
 
-    def val_dataloader(self):
+    def val_dataloader(self) -> DataLoader:
+        """Return the validation DataLoader."""
         return DataLoader(
             self.val_set,
             batch_size=self.batch_size,
@@ -78,7 +93,8 @@ class NSDDataModule(L.LightningDataModule):
         )
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", required=True, help="NSD root folder containing subject subfolders")
     parser.add_argument("--batch_size", type=int, default=1)
@@ -86,18 +102,22 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1.5e-4)
     parser.add_argument("--num_workers", type=int, default=4)
+
+    # Logging & Checkpointing params
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--project", default="7T-fMRI-Denoising")
     parser.add_argument("--name", default="SwinMAE-NSD")
     parser.add_argument("--checkpoint_dir", default="checkpoints_nsd")
+
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
+    """Execute the PyTorch Lightning training pipeline."""
     args = parse_args()
 
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
     print("Preparing data module...")
     datamodule = NSDDataModule(
         data_dir=args.data_dir,
@@ -105,6 +125,7 @@ def main():
         time_frames=args.time_frames,
         num_workers=args.num_workers,
     )
+    # Explicit setup call ensures dataset metrics are available before model init if needed
     datamodule.setup()
 
     print("Initializing model...")
@@ -120,6 +141,7 @@ def main():
     if args.use_wandb:
         logger = WandbLogger(project=args.project, name=args.name, log_model="all")
 
+    # Saves the top 3 models based on lowest validation loss
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
         mode="min",
@@ -134,6 +156,7 @@ def main():
         callbacks=[checkpoint_callback],
         accelerator="auto",
         devices="auto",
+        # 16-mixed precision halves VRAM usage while maintaining gradient stability
         precision="16-mixed",
         log_every_n_steps=1,
     )
