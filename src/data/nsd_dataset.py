@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Sequence
 
 import nibabel as nib
 import numpy as np
@@ -91,6 +91,20 @@ class NSDDataset(Dataset):
             raise FileNotFoundError(f"Missing NIfTI file referenced by manifest: {path}")
         return nib.load(str(path))
 
+    def _resolve_entry_path(self, entry: dict[str, Any], key: str) -> Path:
+        """Resolve a manifest path, supporting portable and legacy manifests."""
+        raw_path = Path(str(entry[key]))
+        if raw_path.is_absolute() and raw_path.is_file():
+            return raw_path
+        manifest_path = Path(str(entry["_manifest_path"]))
+        candidate = (manifest_path.parent.parent / raw_path).resolve()
+        if candidate.is_file():
+            return candidate
+        raise FileNotFoundError(
+            f"Manifest path for {key!r} could not be resolved: {entry[key]!r}. "
+            f"Checked {candidate}."
+        )
+
     @staticmethod
     def _validate_spatial_geometry(
         bold_image: nib.Nifti1Image,
@@ -140,7 +154,7 @@ class NSDDataset(Dataset):
             normalized BOLD, GM, WM, and CSF masks.
         """
         entry = self.entries[index]
-        bold_image = self._load_image(Path(entry["bold_path"]))
+        bold_image = self._load_image(self._resolve_entry_path(entry, "bold_path"))
 
         if len(bold_image.shape) != 4:
             raise ValueError(f"BOLD run must be 4D, got shape {bold_image.shape}")
@@ -172,9 +186,9 @@ class NSDDataset(Dataset):
             bold_data = (bold_data - mean) / max(std, 1e-8)
 
         # Fetch tissue masks (hits cache after the first run)
-        gm = self._load_mask(Path(entry["gm_path"]), bold_image, "GM mask")
-        wm = self._load_mask(Path(entry["wm_path"]), bold_image, "WM mask")
-        csf = self._load_mask(Path(entry["csf_path"]), bold_image, "CSF mask")
+        gm = self._load_mask(self._resolve_entry_path(entry, "gm_path"), bold_image, "GM mask")
+        wm = self._load_mask(self._resolve_entry_path(entry, "wm_path"), bold_image, "WM mask")
+        csf = self._load_mask(self._resolve_entry_path(entry, "csf_path"), bold_image, "CSF mask")
 
         # Convert to [Time, X, Y, Z]
         bold_time_first = np.transpose(bold_data, (3, 0, 1, 2))

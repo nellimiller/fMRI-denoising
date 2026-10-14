@@ -6,10 +6,16 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from models.decoder import CascadingDecoder
-from models.patch_embed import fMRIPatchEmbed4D
-from models.swift_official import MERGING_MODE, BasicLayer
-from utils.masking import apply_swin_mask
+try:
+    from ..utils.masking import apply_swin_mask
+    from .decoder import CascadingDecoder
+    from .patch_embed import fMRIPatchEmbed4D
+    from .swift_official import MERGING_MODE, BasicLayer
+except ImportError:
+    from models.decoder import CascadingDecoder
+    from models.patch_embed import fMRIPatchEmbed4D
+    from models.swift_official import MERGING_MODE, BasicLayer
+    from utils.masking import apply_swin_mask
 
 
 class HierarchicalSwinMAE(nn.Module):
@@ -97,12 +103,24 @@ class HierarchicalSwinMAE(nn.Module):
 
         tokens, spatial_grid = self.patch_embed(x)
         H_p, W_p, D_p = spatial_grid
+        expected_tokens = T * H_p * W_p * D_p
+        if tokens.shape[1] != expected_tokens:
+            raise RuntimeError(
+                "Patch embedding produced an inconsistent token grid: "
+                f"{tokens.shape[1]} tokens, expected {expected_tokens} "
+                f"for T={T}, grid={spatial_grid}."
+            )
 
         # Apply MAE token dropping strategy
         x_masked, mask = apply_swin_mask(tokens, self.mask_token, self.mask_ratio, tube_masking, T)
 
         # Inject positional embeddings up to the current sequence length
         L = x_masked.shape[1]
+        if L > self.pos_embed.shape[1]:
+            raise ValueError(
+                f"Token sequence length {L} exceeds positional embedding capacity "
+                f"{self.pos_embed.shape[1]}."
+            )
         x_masked = x_masked + self.pos_embed[:, :L, :]
 
         # Reshape 1D token sequence back into 4D spatial-temporal grid for Swin stages
@@ -123,6 +141,12 @@ class HierarchicalSwinMAE(nn.Module):
 
         # Decode latent representation into clean and noise components
         clean_pred, noise_pred = self.decoder(latent, spatial_grid, T)
+        expected_shape = (T, H_p * self.patch_embed.patch_size, W_p * self.patch_embed.patch_size, D_p * self.patch_embed.patch_size)
+        if clean_pred.shape[2:] != expected_shape:
+            raise RuntimeError(
+                f"Decoder output shape {tuple(clean_pred.shape[2:])} does not match "
+                f"the padded patch grid {expected_shape}."
+            )
         reconstruction = clean_pred + noise_pred
 
         if return_heads:

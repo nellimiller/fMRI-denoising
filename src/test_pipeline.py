@@ -25,7 +25,7 @@ def run_pipeline_test():
 
     # 4. Calculating Loss
     print("Calculating structural decomposition loss...")
-    total_loss, mse, fft = loss_fn(
+    losses = loss_fn(
         pred=final_output,
         target=dummy_fmri,
         mask=mask,
@@ -36,14 +36,14 @@ def run_pipeline_test():
         csf_mask=dummy_fmri[:, 3:4],
     )
     
-    print(f"\n--- Loss Output ---")
-    print(f"Masked MSE Loss: {mse.item():.4f}")
-    print(f"Temporal FFT Loss: {fft.item():.4f}")
-    print(f"Total Loss: {total_loss.item():.4f}")
+    print("\n--- Loss Output ---")
+    print(f"Masked MSE Loss: {losses['masked_mse'].item():.4f}")
+    print(f"Temporal FFT Loss: {losses['fft'].item():.4f}")
+    print(f"Total Loss: {losses['total'].item():.4f}")
     
     # 5. Check backward pass (Gradient calculation)
     print("Testing backward pass (gradient flow)...")
-    total_loss.backward()
+    losses["total"].backward()
     print("SUCCESS: The pipeline and loss engine are fully operational.")
 
 if __name__ == "__main__":

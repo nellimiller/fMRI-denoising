@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -129,6 +130,10 @@ def preprocess_subject(
         raise FileNotFoundError(f"No NSD imagery runs found in {timeseries_root}")
 
     entries = []
+
+    def portable_path(path: Path) -> str:
+        return os.path.relpath(path.resolve(), output_root.resolve()).replace("\\", "/")
+
     for run_path in runs:
         bold_image = nib.load(str(run_path))
         if len(bold_image.shape) != 4:
@@ -146,10 +151,10 @@ def preprocess_subject(
                 {
                     "subject": subject,
                     "run": run_path.stem.removesuffix(".nii"),
-                    "bold_path": str(run_path.resolve()),
-                    "gm_path": str((anat_output / "gm.nii.gz").resolve()),
-                    "wm_path": str((anat_output / "wm.nii.gz").resolve()),
-                    "csf_path": str((anat_output / "csf.nii.gz").resolve()),
+                    "bold_path": portable_path(run_path),
+                    "gm_path": portable_path(anat_output / "gm.nii.gz"),
+                    "wm_path": portable_path(anat_output / "wm.nii.gz"),
+                    "csf_path": portable_path(anat_output / "csf.nii.gz"),
                     "start": start,
                     "stop": start + window_length,
                     "timepoints": timepoints,

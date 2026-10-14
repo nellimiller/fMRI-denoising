@@ -8,8 +8,12 @@ import lightning as L
 import torch
 import torch.optim as optim
 
-from models.mae_core import HierarchicalSwinMAE
-from utils.losses import fMRIMaskedLoss
+try:
+    from ..utils.losses import fMRIMaskedLoss
+    from .mae_core import HierarchicalSwinMAE
+except ImportError:
+    from models.mae_core import HierarchicalSwinMAE
+    from utils.losses import fMRIMaskedLoss
 
 class fMRIDenoisingLightning(L.LightningModule):
     """Lightning module coordinating the SwinMAE architecture and dual-engine loss.
@@ -29,7 +33,12 @@ class fMRIDenoisingLightning(L.LightningModule):
         embed_dim: int = 96,
         mask_ratio: float = 0.75,
         lr: float = 1.5e-4,
-        weight_decay: float = 0.05
+        weight_decay: float = 0.05,
+        masked_loss_weight: float = 1.0,
+        full_loss_weight: float = 1.0,
+        flat_loss_weight: float = 1.0,
+        ortho_loss_weight: float = 1e-3,
+        fft_loss_weight: float = 0.1,
     ) -> None:
         """Initialize hyperparameters, core model, and loss function."""
         super().__init__()
@@ -43,8 +52,12 @@ class fMRIDenoisingLightning(L.LightningModule):
         )
 
         self.loss_fn = fMRIMaskedLoss(
-            patch_size=self.hparams.patch_size, 
-            fft_weight=0.1
+            patch_size=self.hparams.patch_size,
+            masked_loss_weight=self.hparams.masked_loss_weight,
+            full_loss_weight=self.hparams.full_loss_weight,
+            flat_weight=self.hparams.flat_loss_weight,
+            ortho_weight=self.hparams.ortho_loss_weight,
+            fft_weight=self.hparams.fft_loss_weight,
         )
 
     def forward(
@@ -77,7 +90,7 @@ class fMRIDenoisingLightning(L.LightningModule):
         noise_cropped = noise_pred[:, :, :, :X, :Y, :Z]
 
         # Compute dual-engine loss using anatomical tissue priors (channels 1, 2, 3)
-        total_loss, mse, fft = self.loss_fn(
+        losses = self.loss_fn(
             pred_cropped,
             target=batch,
             mask=mask,
@@ -88,11 +101,21 @@ class fMRIDenoisingLightning(L.LightningModule):
             csf_mask=batch[:, 3:4],
         )
 
-        self.log(f"{phase}_loss", total_loss, prog_bar=True, sync_dist=True)
-        self.log(f"{phase}_mse", mse, sync_dist=True)
-        self.log(f"{phase}_fft", fft, sync_dist=True)
+        for name, value in losses.items():
+            self.log(f"{phase}_{name}", value, prog_bar=name == "total", sync_dist=True)
+        self.log(
+            f"{phase}_clean_energy",
+            clean_cropped.square().mean(),
+            sync_dist=True,
+        )
+        self.log(
+            f"{phase}_noise_energy",
+            noise_cropped.square().mean(),
+            sync_dist=True,
+        )
+        self.log(f"{phase}_mask_fraction", mask.float().mean(), sync_dist=True)
 
-        return total_loss
+        return losses["total"]
 
     def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
         """Process a single training batch."""

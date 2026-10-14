@@ -98,8 +98,8 @@ class StructuralDenoisingLoss(nn.Module):
         # 2. L_flat: Penalize temporal variance of the *clean* prediction inside WM/CSF
         clean_tissue = clean_pred * tissue_mask
         clean_var = clean_tissue.var(dim=2, unbiased=False)
-        tissue_weight = tissue_mask[:, :, 0:1] if tissue_mask.dim() == 6 else tissue_mask
-        flat_loss = (clean_var * tissue_weight).sum() / (tissue_weight.sum().clamp_min(1.0))
+        tissue_weight = tissue_mask[:, :, 0]
+        flat_loss = (clean_var * tissue_weight).sum() / tissue_weight.sum().clamp_min(1.0)
 
         # 3. L_ortho (Deep aCompCor-style loss)
         # Extract the average temporal noise summary from the WM+CSF volume
@@ -111,9 +111,13 @@ class StructuralDenoisingLoss(nn.Module):
         noise_vector = noise_summary.squeeze(-1).squeeze(-1).squeeze(-1)[:, 0, :]
 
         # Penalize correlation between GM signal and the global noise summary
-        gm_voxels = (clean_pred * gm_mask).reshape(clean_pred.shape[0], -1, clean_pred.shape[2])
-        gm_scores = torch.matmul(gm_voxels, noise_vector.unsqueeze(-1))
-        ortho_loss = gm_scores.pow(2).mean()
+        clean_time_first = (clean_pred * gm_mask).permute(0, 1, 3, 4, 5, 2)
+        gm_voxels = clean_time_first.reshape(clean_pred.shape[0], -1, clean_pred.shape[2])
+        gm_voxels = gm_voxels - gm_voxels.mean(dim=-1, keepdim=True)
+        centered_noise = noise_vector - noise_vector.mean(dim=-1, keepdim=True)
+        gm_scores = torch.matmul(gm_voxels, centered_noise.unsqueeze(-1))
+        gm_count = gm_mask[:, :, 0].sum().clamp_min(1.0)
+        ortho_loss = gm_scores.pow(2).sum() / gm_count
 
         # 4. Fast Fourier Transform Loss (Spectrum Matching)
         pred_fft = torch.fft.rfft(total_pred, dim=2)
@@ -139,11 +143,18 @@ class fMRIMaskedLoss(nn.Module):
         fft_weight: float = 0.1, 
         flat_weight: float = 1.0, 
         ortho_weight: float = 1e-3, 
+        masked_loss_weight: float = 1.0,
+        full_loss_weight: float = 1.0,
         merge_stages: int = 3
     ) -> None:
         """Initialize the loss wrapper."""
         super().__init__()
         self.patch_size = patch_size
+        self.masked_loss_weight = masked_loss_weight
+        self.full_loss_weight = full_loss_weight
+        self.flat_weight = flat_weight
+        self.ortho_weight = ortho_weight
+        self.fft_weight = fft_weight
         self.grid_multiple = 2 ** merge_stages
         self.structural_loss = StructuralDenoisingLoss(
             patch_size=patch_size,
@@ -168,8 +179,8 @@ class fMRIMaskedLoss(nn.Module):
         gm_mask: torch.Tensor | None = None, 
         wm_mask: torch.Tensor | None = None, 
         csf_mask: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute structural loss alongside Masked-MSE (calculating MSE only on dropped patches)."""
+    ) -> dict[str, torch.Tensor]:
+        """Compute masked reconstruction and structural losses."""
         if isinstance(pred, (tuple, list)):
             total_pred, clean_pred, noise_pred = pred
         else:
@@ -193,6 +204,12 @@ class fMRIMaskedLoss(nn.Module):
             Dp = ((min_d + M - 1) // M) * M
 
             # Reshape the 1D token mask back into the 4D voxel space
+            expected_tokens = T * Hp * Wp * Dp
+            if mask.shape[1] != expected_tokens:
+                raise ValueError(
+                    f"Mask has {mask.shape[1]} tokens, expected {expected_tokens} "
+                    f"for output shape {(T, X, Y, Z)} and patch size {P}."
+                )
             mask_grid = rearrange(mask, 'b (t hp wp dp) -> b 1 t hp wp dp', t=T, hp=Hp, wp=Wp, dp=Dp)
             voxel_mask = repeat(mask_grid, 'b 1 t hp wp dp -> b 1 t (hp p1) (wp p2) (dp p3)', p1=P, p2=P, p3=P)
             voxel_mask = voxel_mask[:, :, :, :X, :Y, :Z]
@@ -202,7 +219,7 @@ class fMRIMaskedLoss(nn.Module):
         else:
             masked_mse = F.mse_loss(total_pred, target[:, :1])
 
-        total_loss, recon_loss, flat_loss, ortho_loss, fft_loss = self.structural_loss(
+        structural_total, recon_loss, flat_loss, ortho_loss, fft_loss = self.structural_loss(
             clean_pred=clean_pred,
             noise_pred=noise_pred,
             target=target,
@@ -211,4 +228,19 @@ class fMRIMaskedLoss(nn.Module):
             csf_mask=csf_mask,
         )
         
-        return total_loss, masked_mse, fft_loss
+        total_loss = (
+            self.masked_loss_weight * masked_mse
+            + self.full_loss_weight * recon_loss
+            + self.flat_weight * flat_loss
+            + self.ortho_weight * ortho_loss
+            + self.fft_weight * fft_loss
+        )
+        return {
+            "total": total_loss,
+            "masked_mse": masked_mse,
+            "reconstruction": recon_loss,
+            "flat": flat_loss,
+            "ortho": ortho_loss,
+            "fft": fft_loss,
+            "structural_total": structural_total,
+        }

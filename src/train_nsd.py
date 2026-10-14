@@ -13,12 +13,19 @@ import argparse
 from pathlib import Path
 
 import lightning as L
+import torch
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 
-from data.nsd_dataset import NSDDataset
-from models.lightning_model import fMRIDenoisingLightning
+try:
+    from .data.nsd_dataset import NSDDataset
+    from .models.lightning_model import fMRIDenoisingLightning
+    from .utils.visualization import ValidationVisualizationCallback
+except ImportError:
+    from data.nsd_dataset import NSDDataset
+    from models.lightning_model import fMRIDenoisingLightning
+    from utils.visualization import ValidationVisualizationCallback
 
 
 class NSDDataModule(L.LightningDataModule):
@@ -40,6 +47,8 @@ class NSDDataModule(L.LightningDataModule):
         num_workers: int = 4,
         val_split: float = 0.2,
         subjects: list[str] | None = None,
+        crop_size: tuple[int, int, int] | None = None,
+        seed: int = 1234,
     ) -> None:
         """Initialize dataloader hyperparameters."""
         super().__init__()
@@ -49,28 +58,40 @@ class NSDDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.val_split = val_split
         self.subjects = subjects
+        self.crop_size = crop_size
+        self.seed = seed
 
     def setup(self, stage: str | None = None) -> None:
         """Parse JSON manifests and split the dataset into training and validation sets."""
         self.full_dataset = NSDDataset(
             self.data_dir,
             subjects=self.subjects,
-            time_frames=self.time_frames
+            time_frames=self.time_frames,
+            crop_size=self.crop_size,
         )
 
         total_len = len(self.full_dataset)
         if total_len == 0:
             raise RuntimeError(f"No subjects found in {self.data_dir}")
 
-        val_len = int(total_len * self.val_split)
-        train_len = total_len - val_len
+        groups: dict[tuple[str, str], list[int]] = {}
+        for index, entry in enumerate(self.full_dataset.entries):
+            key = (str(entry["subject"]), str(entry["run"]))
+            groups.setdefault(key, []).append(index)
 
-        # Guardrail for extremely small dataset testing
-        if val_len == 0:
-            val_len = 1
-            train_len = total_len - 1
-
-        self.train_set, self.val_set = random_split(self.full_dataset, [train_len, val_len])
+        generator = torch.Generator().manual_seed(self.seed)
+        group_keys = list(groups)
+        if len(group_keys) < 2:
+            raise ValueError("At least two subject/run groups are required for validation.")
+        permutation = torch.randperm(len(group_keys), generator=generator).tolist()
+        val_groups = min(len(group_keys) - 1, max(1, round(len(group_keys) * self.val_split)))
+        val_keys = {group_keys[i] for i in permutation[:val_groups]}
+        val_indices = [i for key, indices in groups.items() if key in val_keys for i in indices]
+        train_indices = [i for key, indices in groups.items() if key not in val_keys for i in indices]
+        if not train_indices:
+            raise ValueError("The subject/run split left no training examples.")
+        self.train_set = Subset(self.full_dataset, train_indices)
+        self.val_set = Subset(self.full_dataset, val_indices)
 
     def train_dataloader(self) -> DataLoader:
         """Return the training DataLoader with pinned memory for fast GPU transfers."""
@@ -102,12 +123,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1.5e-4)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--crop_size", nargs=3, type=int, default=None)
+    parser.add_argument("--gradient_clip_val", type=float, default=1.0)
+    parser.add_argument("--precision", default="16-mixed")
 
     # Logging & Checkpointing params
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--project", default="7T-fMRI-Denoising")
     parser.add_argument("--name", default="SwinMAE-NSD")
     parser.add_argument("--checkpoint_dir", default="checkpoints_nsd")
+    parser.add_argument("--visualization_dir", default="validation_visualizations")
+    parser.add_argument("--visualize_every_n_epochs", type=int, default=1)
 
     return parser.parse_args()
 
@@ -115,8 +142,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Execute the PyTorch Lightning training pipeline."""
     args = parse_args()
-
-    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    L.seed_everything(args.seed, workers=True)
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     print("Preparing data module...")
     datamodule = NSDDataModule(
@@ -124,6 +152,8 @@ def main() -> None:
         batch_size=args.batch_size,
         time_frames=args.time_frames,
         num_workers=args.num_workers,
+        crop_size=tuple(args.crop_size) if args.crop_size else None,
+        seed=args.seed,
     )
     # Explicit setup call ensures dataset metrics are available before model init if needed
     datamodule.setup()
@@ -146,18 +176,24 @@ def main() -> None:
         monitor="val_loss",
         mode="min",
         save_top_k=3,
-        dirpath=args.checkpoint_dir,
+        dirpath=checkpoint_dir,
         filename="swinmae-nsd-{epoch:02d}-{val_loss:.4f}",
+        save_last=True,
+    )
+    visualization_callback = ValidationVisualizationCallback(
+        output_dir=args.visualization_dir,
+        every_n_epochs=args.visualize_every_n_epochs,
     )
 
     trainer = L.Trainer(
         max_epochs=args.epochs,
         logger=logger,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, visualization_callback],
         accelerator="auto",
         devices="auto",
         # 16-mixed precision halves VRAM usage while maintaining gradient stability
-        precision="16-mixed",
+        precision=args.precision,
+        gradient_clip_val=args.gradient_clip_val,
         log_every_n_steps=1,
     )
 

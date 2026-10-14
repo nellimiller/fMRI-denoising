@@ -89,3 +89,35 @@ Houses the official Swin Transformer blocks (BasicLayer) and merging configurati
 Contains the core logic for the masking strategy (e.g. apply_swin_mask), ensuring the specific 75% tube masking ratio is properly applied to tokens before they hit the encoder.
 ### losses.py :
 Defines the custom dual-engine loss function (fMRIMaskedLoss) which computes and combines the Masked Mean Squared Error (MSE) and Temporal Fast Fourier Transform (FFT) loss to guide reconstruction.
+
+## First NSD training run
+
+Preprocess each subject into a portable manifest, then launch the canonical
+training entry point from the repository root:
+
+```powershell
+uv run python -m src.data_preprocessing.nsd.preprocess `
+  --raw-root "C:\path\to\nsd_data" `
+  --output-root "C:\path\to\nsd_processed" `
+  --subject subj01 `
+  --window-length 40 `
+  --stride 20
+
+uv run python -m src.train_nsd `
+  --data_dir "C:\path\to\nsd_processed" `
+  --crop_size 64 64 64 `
+  --epochs 1 `
+  --num_workers 4 `
+  --precision 32-true
+```
+
+The training script splits complete subject/run groups rather than overlapping
+temporal windows, logs every reconstruction and structural loss component,
+saves the last and best checkpoints, and writes fixed validation slice panels
+to `validation_visualizations/`. Use `--use_wandb` to additionally log metrics
+to Weights & Biases.
+
+The decomposition remains an unsupervised research hypothesis: reconstruction
+alone cannot uniquely identify clean and noise components. Inspect the
+clean/noise energy metrics and validation panels before interpreting a run as
+successful denoising.
