@@ -1,99 +1,40 @@
-fMRI-denoising
-Deep Learning-Based Denoising of Ultra-High-Field 7 Tesla Functional Magnetic Resonance Imaging Data
+# fMRI Denoising
 
-## Proposed Architecture: Structural Masked Autoencoder for 7T fMRI
+An experimental 4D fMRI masked autoencoder for self-supervised reconstruction
+and exploratory signal decomposition. The current data workflow targets
+Natural Scenes Dataset (NSD) functional runs and uses anatomical grey matter
+(GM), white matter (WM), and cerebrospinal fluid (CSF) masks.
 
-This project implements a 4D fMRI masked autoencoder baseline based on the SWIFT/Swin Transformer family and extends it with an additive decomposition objective for denoising.
+## Status and interpretation
 
-The encoder is trained as an unsupervised masked autoencoder, while the decoder splits its output into two heads:
+The model reconstructs the observed BOLD signal as the sum of two learned
+outputs:
 
-- `Y_clean`: the denoised neural/BOLD component in grey matter
-- `Y_noise`: physiological and scanner-related nuisance signal routed to CSF/WM
+```text
+reconstruction = clean_head + noise_head
+```
 
-The total reconstruction satisfies:
+Training uses masked reconstruction together with full reconstruction,
+tissue-based regularizers, and a temporal FFT term. There is no clean fMRI
+target in this workflow. Consequently, reconstruction and anatomical priors
+alone do not uniquely identify the clean and noise components. Treat the
+separation as an experimental hypothesis, not validated denoising; inspect
+the component metrics and visualizations before drawing conclusions.
 
-Y_total = Y_clean + Y_noise
+## Environment
 
-The training objective follows the structural decomposition described in the project notes:
+The project requires Python 3.12 or newer and uses `uv`:
 
-L_total = L_recon + lambda_1 L_flat + lambda_2 L_ortho
+```powershell
+uv sync
+```
 
-`L_flat` is computed as temporal variance over time for voxels in WM/CSF for the clean branch, and `L_ortho` is implemented as a deep aCompCor-style summary penalty: a single temporal noise vector averaged over WM/CSF is projected against each GM voxel time series, avoiding the memory-heavy token-to-token covariance matrix. This keeps the model fully self-supervised while remaining computationally stable for high-resolution 7T data. The first implementation targets the Natural Scenes Dataset and uses anatomical masks derived from the structural scan (GM, WM, CSF) to build spatiotemporal masking and penalty terms.
+## NSD workflow
 
-## Directory Hierarchy
+### 1. Prepare subject manifests
 
-fMRI-denoising/
-├── .gitignore
-├── notes.txt
-├── pyproject.toml
-├── uv.lock
-├── README.md
-└── src/
-    ├── main.py
-    ├── test_pipeline.py
-    ├── data/
-    │   ├── __init__.py
-    │   ├── dataset.py
-    │   └── preprocess.py
-    ├── models/
-    │   ├── __init__.py
-    │   ├── decoder.py
-    │   ├── lightning_model.py
-    │   ├── mae_core.py
-    │   ├── patch_embed.py
-    │   └── swift_official.py
-    └── utils/
-        ├── __init__.py
-        ├── losses.py
-        └── masking.py
-
-
-## Root Directory
-Files managing the environment, dependencies, project metadata
-### pyproject.toml & uv.lock :
-define project dependencies ensuring reproducible environment using uv package manager
-### .gitignore :
-specifies intentionally untracked files to ignore for clean version control
-### notes.txt :
-local scratchpad for tracking next steps and project to-dos
-
-
-## Core Execution (src/)
-### main.py :
-Primary entry point for training. Configures PyTorch Lightning Trainer, initializes the fMRIDataModule to handle batching and splitting, sets up WandbLogger for experiment tracking, establishes ModelCheckpoint callbacks to save the best-performing models.
-### test_pipeline.py :
-A diagnostic script that verifies the functionality of the model and loss engines by running a simulated forward and backward pass using small, randomly generated dummy fMRI tensors.
-
-
-## Data Handling (src/data/)
-### dataset.py :
-Contains the custom fMRIDataset class. It uses nibabel to load 4D BOLD signals and 3D anatomical masks (Grey Matter, White Matter, CSF). The script performs critical pre-processing, including global Z-score normalization, sequence length padding/truncation (enforcing 40 timeframes), and tensor merging using einops to match BOLD and mask dimensions.
-### preprocess.py :
-Contains a preprocessing script acting as one-time data preparation step. Loops through all patient folders, converts the structual DICOMs to a T1 NIfTI, run 
-
-
-## Model Architecture (src/models/)
-### mae_core.py :
-defines the central HierarchicalSwinMAE Autoencoder. It ties together the patch embedding, the 4-stage Swin Transformer encoder pyramid, and the cascading decoder into a single, cohesive architecture.
-### lightning_model.py :
-The PyTorch Lightning wrapper (fMRIDenoisingLightning). It defines the specific training and validation step logic, dynamic cropping to match prediction and target dimensions, and configures the optimizer (AdamW) with a Cosine Annealing learning rate scheduler.
-### decoder.py :
-Contains the CascadingDecoder class. It walks the 4-stage feature representations back up the pyramid using 3D transposed convolutions, progressively inflating the tokens back into original voxel space.
-### patch_embed.py :
-Contains the logic responsible for tokenizing the complex 4D fMRI data so it can be processed by the Transformer blocks.
-### swift_official.py :
-Houses the official Swin Transformer blocks (BasicLayer) and merging configurations (MERGING_MODE) utilized by the core MAE encoder stages.
-
-## Utilities & Operations (src/utils/)
-### masking.py :
-Contains the core logic for the masking strategy (e.g. apply_swin_mask), ensuring the specific 75% tube masking ratio is properly applied to tokens before they hit the encoder.
-### losses.py :
-Defines the custom dual-engine loss function (fMRIMaskedLoss) which computes and combines the Masked Mean Squared Error (MSE) and Temporal Fast Fourier Transform (FFT) loss to guide reconstruction.
-
-## First NSD training run
-
-Preprocess each subject into a portable manifest, then launch the canonical
-training entry point from the repository root:
+The preprocessing command creates GM/WM/CSF masks and a manifest of temporal
+windows. It references BOLD NIfTI files instead of copying large runs.
 
 ```powershell
 uv run python -m src.data_preprocessing.nsd.preprocess `
@@ -102,7 +43,35 @@ uv run python -m src.data_preprocessing.nsd.preprocess `
   --subject subj01 `
   --window-length 40 `
   --stride 20
+```
 
+Expected processed-data layout:
+
+```text
+nsd_processed/
+└── subj01/
+    ├── anat/
+    │   ├── gm.nii.gz
+    │   ├── wm.nii.gz
+    │   └── csf.nii.gz
+    └── manifest.json
+```
+
+Manifest paths are relative to the processed-data root, so the dataset can be
+moved between machines as long as the referenced raw data remains at the
+corresponding relative location. The loader also accepts existing absolute
+paths when they still resolve.
+
+The preprocessing expects the NSD layout described in
+[the NSD preprocessing guide](src/data_preprocessing/nsd/README.md). Review
+the label sets in `src/data_preprocessing/nsd/preprocess.py` if the
+segmentation convention differs from the one used for the data.
+
+### 2. Run a short training trial
+
+From the repository root:
+
+```powershell
 uv run python -m src.train_nsd `
   --data_dir "C:\path\to\nsd_processed" `
   --crop_size 64 64 64 `
@@ -111,13 +80,75 @@ uv run python -m src.train_nsd `
   --precision 32-true
 ```
 
-The training script splits complete subject/run groups rather than overlapping
-temporal windows, logs every reconstruction and structural loss component,
-saves the last and best checkpoints, and writes fixed validation slice panels
-to `validation_visualizations/`. Use `--use_wandb` to additionally log metrics
-to Weights & Biases.
+The crop is optional; use it to reduce memory use during initial runs. The
+data module keeps complete subject/run groups on one side of the train/validation
+split to avoid leakage between overlapping windows. At least two distinct
+subject/run groups are needed.
 
-The decomposition remains an unsupervised research hypothesis: reconstruction
-alone cannot uniquely identify clean and noise components. Inspect the
-clean/noise energy metrics and validation panels before interpreting a run as
-successful denoising.
+Useful options include:
+
+| Option | Purpose |
+| --- | --- |
+| `--seed` | Seed model, split, and worker initialization (default `1234`). |
+| `--crop_size X Y Z` | Crop the volume around the tissue-mask center. |
+| `--precision` | Lightning precision mode; use `32-true` for a conservative smoke run. |
+| `--gradient_clip_val` | Clip gradient norm (default `1.0`). |
+| `--checkpoint_dir` | Save best validation and latest checkpoints. |
+| `--visualization_dir` | Save validation slice panels. |
+| `--use_wandb` | Enable Weights & Biases metric logging. |
+
+Run `uv run python -m src.train_nsd --help` for the complete option list.
+
+## Monitoring outputs
+
+The trainer logs total loss and its masked reconstruction, full reconstruction,
+flatness, orthogonality, and FFT components. It also logs clean/noise output
+energy and the masked-token fraction. Checkpoints are written to
+`checkpoints_nsd/` by default. A validation slice panel for a fixed sample is
+saved to `validation_visualizations/` after each validation epoch; the
+randomized mask means the reconstruction may vary between epochs.
+
+Before a longer run, check that:
+
+- losses and gradients remain finite;
+- the clean and noise heads both have nontrivial energy;
+- the total reconstruction and residuals look plausible in the saved panels;
+- validation performance is interpreted at the subject/run split level.
+
+## Tests and diagnostics
+
+Run the automated tests with:
+
+```powershell
+uv run pytest
+```
+
+They include a small synthetic CPU training smoke test. This verifies basic
+execution and gradient flow, not scientific denoising quality.
+
+For a data-backed one-window overfit diagnostic, see
+[the NSD preprocessing guide](src/data_preprocessing/nsd/README.md). It
+deliberately repeats one window and must not be treated as a generalization
+experiment.
+
+## Code map
+
+```text
+src/
+├── data/
+│   ├── nsd_dataset.py              # Manifest-backed NSD loader
+│   └── synthetic.py                # Synthetic data for smoke tests
+├── data_preprocessing/nsd/
+│   └── preprocess.py               # NSD masks and temporal manifests
+├── models/
+│   ├── mae_core.py                 # Masked hierarchical Swin encoder
+│   ├── decoder.py                  # Additive clean/noise output heads
+│   └── lightning_model.py          # Training steps, metrics, optimizer
+├── utils/
+│   ├── losses.py                   # Reconstruction and structural losses
+│   ├── masking.py                  # Token masking
+│   ├── visualization.py            # Validation slice panels
+│   └── train_nsd_overfit.py        # Single-window diagnostic
+├── train_nsd.py                    # Canonical NSD training entry point
+└── test_pipeline.py                # Manual synthetic forward/backward check
+```

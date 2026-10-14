@@ -38,10 +38,13 @@ The manifest references the raw BOLD files. This avoids duplicating large
 4D files. The training dataset should use each manifest entry as one temporal
 window rather than treating the entire subject as one sample.
 
-For a quick model smoke test, use the isolated overfit script:
+For a data-backed one-window overfit diagnostic, run from the repository root.
+The `PYTHONPATH` setting allows the diagnostic script to use the project's
+source-tree imports:
 
 ```powershell
-uv run python train_nsd_overfit.py `
+$env:PYTHONPATH = "src"
+uv run python src/utils/train_nsd_overfit.py `
   --data_dir "C:\fMRI Denoising\NSD\nsd_processed" `
   --output_dir "C:\fMRI Denoising\NSD\overfit_test" `
   --subject subj01 `
@@ -53,8 +56,8 @@ uv run python train_nsd_overfit.py `
 
 This intentionally repeats one temporal window. It checks data loading,
 spatial dimensions, model forward/backward execution, and loss computation.
-It is not a scientific training configuration. The normal `train_nsd.py`
-path remains separate and unchanged.
+It is not a scientific training configuration and does not assess
+generalization.
 
 The label groups are explicit in `preprocess.py` and should be reviewed if a
 different segmentation convention is used.
