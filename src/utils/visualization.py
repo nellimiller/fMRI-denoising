@@ -9,6 +9,32 @@ import torch
 from lightning.pytorch.callbacks import Callback
 
 
+def crop_to_input(prediction: torch.Tensor, input_sample: torch.Tensor) -> torch.Tensor:
+    """Crop padded predictions to a dataset sample's original spatial extent."""
+    if prediction.ndim != 6:
+        raise ValueError(f"Expected prediction [B, C, T, X, Y, Z], got {prediction.shape}.")
+    if input_sample.ndim != 5:
+        raise ValueError(f"Expected input sample [C, T, X, Y, Z], got {input_sample.shape}.")
+    if prediction.shape[0] != 1 or prediction.shape[1] != 1:
+        raise ValueError(
+            "Visualization expects one sample and one predicted BOLD channel, "
+            f"got shape {prediction.shape}."
+        )
+    if prediction.shape[2] != input_sample.shape[1]:
+        raise ValueError(
+            f"Prediction has {prediction.shape[2]} time points, "
+            f"input has {input_sample.shape[1]}."
+        )
+
+    target_spatial = input_sample.shape[2:]
+    if any(actual < target for actual, target in zip(prediction.shape[3:], target_spatial)):
+        raise ValueError(
+            f"Prediction spatial shape {prediction.shape[3:]} is smaller than "
+            f"input shape {target_spatial}."
+        )
+    return prediction[:, :, :, : target_spatial[0], : target_spatial[1], : target_spatial[2]]
+
+
 class ValidationVisualizationCallback(Callback):
     """Save a fixed validation reconstruction panel after each validation epoch."""
 
@@ -34,15 +60,16 @@ class ValidationVisualizationCallback(Callback):
         device = pl_module.device
         was_training = pl_module.training
         pl_module.eval()
-        with torch.no_grad():
-            prediction, clean, noise, _ = pl_module(batch.unsqueeze(0).to(device))
-        if was_training:
-            pl_module.train()
+        try:
+            with torch.no_grad():
+                prediction, clean, noise, _ = pl_module(batch.unsqueeze(0).to(device))
+        finally:
+            pl_module.train(was_training)
 
+        prediction = crop_to_input(prediction, batch)[0, 0].detach().cpu()
+        clean = crop_to_input(clean, batch)[0, 0].detach().cpu()
+        noise = crop_to_input(noise, batch)[0, 0].detach().cpu()
         input_bold = batch[0].cpu()
-        prediction = prediction[0, 0].detach().cpu()
-        clean = clean[0, 0].detach().cpu()
-        noise = noise[0, 0].detach().cpu()
         time_index = input_bold.shape[0] // 2
         spatial_slice = input_bold.shape[-1] // 2
 

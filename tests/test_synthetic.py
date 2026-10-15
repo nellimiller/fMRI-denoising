@@ -8,6 +8,17 @@ from torch.utils.data import DataLoader, random_split
 
 from data.synthetic import SyntheticNSDDataset
 from models.lightning_model import fMRIDenoisingLightning
+from utils.visualization import crop_to_input
+
+
+def test_visualization_crops_padded_predictions() -> None:
+    sample = torch.zeros(4, 8, 30, 27, 19)
+    padded_prediction = torch.ones(1, 1, 8, 32, 32, 24)
+
+    cropped = crop_to_input(padded_prediction, sample)
+
+    assert cropped.shape == (1, 1, 8, 30, 27, 19)
+    assert torch.equal(cropped, torch.ones_like(cropped))
 
 
 def test_synthetic_dataset_shape() -> None:

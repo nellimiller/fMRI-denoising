@@ -1,10 +1,11 @@
 """Small isolated NSD overfit test.
 
-Run from ``src``:
+Run from the repository root:
 
-    uv run python train_nsd_overfit.py \
+    uv run python -m src.utils.train_nsd_overfit \
       --data_dir "C:\\fMRI Denoising\\NSD\\nsd_processed" \
       --output_dir "C:\\fMRI Denoising\\NSD\\overfit_test" \
+      --time_frames 8 \
       --crop_size 64 64 32 --epochs 10
 
 This intentionally repeats one temporal window. It is a diagnostic for data
@@ -19,10 +20,17 @@ from pathlib import Path
 
 import lightning as L
 import torch
+from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 
-from data.nsd_dataset import NSDDataset
-from models.lightning_model import fMRIDenoisingLightning
+try:
+    from ..data.nsd_dataset import NSDDataset
+    from ..models.lightning_model import fMRIDenoisingLightning
+    from .visualization import ValidationVisualizationCallback
+except ImportError:
+    from data.nsd_dataset import NSDDataset
+    from models.lightning_model import fMRIDenoisingLightning
+    from utils.visualization import ValidationVisualizationCallback
 
 
 class RepeatedDataset(Dataset):
@@ -143,6 +151,10 @@ def main() -> None:
         logger=False,
         enable_checkpointing=True,
         default_root_dir=str(output_dir),
+        callbacks=[
+            ModelCheckpoint(save_last=True, save_top_k=0),
+            ValidationVisualizationCallback(output_dir / "visualizations"),
+        ],
         limit_val_batches=1,
         log_every_n_steps=1,
         precision="32-true",

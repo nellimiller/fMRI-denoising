@@ -80,10 +80,11 @@ uv run python -m src.train_nsd `
   --precision 32-true
 ```
 
-The crop is optional; use it to reduce memory use during initial runs. The
-data module keeps complete subject/run groups on one side of the train/validation
-split to avoid leakage between overlapping windows. At least two distinct
-subject/run groups are needed.
+The data module keeps complete subject/run groups on one side of the
+train/validation split to avoid leakage between overlapping windows. At least
+two distinct subject/run groups are needed. Note that the default patch size
+and three encoder merges impose a minimum padded grid of 112 voxels per spatial
+axis, so crops smaller than that do not necessarily reduce model memory.
 
 Useful options include:
 
@@ -99,6 +100,55 @@ Useful options include:
 
 Run `uv run python -m src.train_nsd --help` for the complete option list.
 
+### Local GPU smoke training with one real NSD window
+
+First verify that PyTorch can see your local NVIDIA GPU:
+
+```powershell
+nvidia-smi
+uv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No CUDA GPU detected')"
+```
+
+If `torch.cuda.is_available()` is false, install a CUDA-enabled PyTorch build
+compatible with your GPU and driver, following the official PyTorch
+installation instructions for your system. The following diagnostic requests
+the GPU explicitly and should fail rather than silently run on CPU.
+
+Generate a small manifest with short windows and at most one window per run:
+
+```powershell
+uv run python -m src.data_preprocessing.nsd.preprocess `
+  --raw-root "C:\path\to\nsd_data" `
+  --output-root "C:\path\to\nsd_processed_smoke" `
+  --subject subj01 `
+  --window-length 8 `
+  --stride 10000
+```
+
+Then train repeatedly on one real window:
+
+```powershell
+uv run python -m src.utils.train_nsd_overfit `
+  --data_dir "C:\path\to\nsd_processed_smoke" `
+  --output_dir "C:\path\to\fmri_runs\local_smoke" `
+  --subject subj01 `
+  --entry 0 `
+  --time_frames 8 `
+  --crop_size 32 32 32 `
+  --patch_size 4 `
+  --epochs 2 `
+  --repeats 4
+```
+
+This checks real-data loading, GPU forward/backward execution, and produces
+initial qualitative outputs. It intentionally reuses one sample, so it is not
+a validation or denoising-quality experiment. A latest checkpoint is saved
+under the output directory, and validation slice panels are saved in its
+`visualizations/` subdirectory. Increase the spatial crop, temporal length, and
+number of training samples only after checking runtime and GPU memory. The
+regular training entry point uses patch size 14 and can require substantially
+more memory than this diagnostic.
+
 ## Monitoring outputs
 
 The trainer logs total loss and its masked reconstruction, full reconstruction,
@@ -107,6 +157,19 @@ energy and the masked-token fraction. Checkpoints are written to
 `checkpoints_nsd/` by default. A validation slice panel for a fixed sample is
 saved to `validation_visualizations/` after each validation epoch; the
 randomized mask means the reconstruction may vary between epochs.
+
+## Adding evaluation metrics
+
+Metrics computable from model predictions and the original inputs can usually
+be calculated after training: load a saved checkpoint, run inference on
+held-out data, and compute them in an evaluation script. Add a metric before
+training if it should affect optimization, be logged during training, control
+early stopping/checkpoint selection, or guide decisions during the run.
+
+In either case, retain the checkpoint and evaluation data, plus needed
+metadata such as TR. Without clean ground-truth fMRI, metrics against observed
+BOLD quantify reconstruction or consistency, not denoising accuracy; they do
+not prove that the clean output is noise-free.
 
 Before a longer run, check that:
 
