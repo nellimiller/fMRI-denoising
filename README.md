@@ -29,6 +29,11 @@ The project requires Python 3.12 or newer and uses `uv`:
 uv sync
 ```
 
+The training environment pins PyTorch 2.6.0, torchvision 0.21.0, and
+torchaudio 2.6.0 to their CUDA 12.4 builds. The CUDA runtime is bundled with
+these PyTorch wheels; the cluster still needs an NVIDIA driver compatible
+with CUDA 12.4. See the Slurm setup below for environment and GPU checks.
+
 ## NSD workflow
 
 ### 1. Prepare subject manifests
@@ -177,6 +182,105 @@ Before a longer run, check that:
 - the clean and noise heads both have nontrivial energy;
 - the total reconstruction and residuals look plausible in the saved panels;
 - validation performance is interpreted at the subject/run split level.
+
+## Slurm cluster pilot
+
+The cluster helpers are in `scripts/cluster/`. They assume the repository is
+checked out on shared storage and that `uv` is available. Ask the cluster
+administrator which Python/CUDA modules, GPU request syntax, partition,
+account, memory limit, and persistent storage should be used; the Slurm
+directives below are a starting point, not universal cluster settings.
+
+### 1. Transfer the code
+
+Prefer transferring code with Git rather than copying a local virtual
+environment:
+
+```bash
+git clone <your-repository-url> fMRI-denoising
+cd fMRI-denoising
+```
+
+If you have uncommitted changes, commit/push them first or transfer those
+specific source changes separately. Do not transfer `.venv/`, caches, model
+checkpoints, or local datasets as part of the code checkout.
+
+### 2. Make the data available to compute nodes
+
+Follow the NSD data agreement and your institution's storage/transfer rules.
+Prefer an approved transfer service or cluster data-transfer node for large
+datasets; avoid routing the full dataset through a personal computer unless
+that is the approved and practical route. Keep raw data read-only on storage
+that compute nodes can access.
+
+On the cluster, define the raw-data, processed-data, and persistent-run paths:
+
+```bash
+export NSD_RAW=/path/to/nsd_data
+export NSD_PROCESSED=/path/to/nsd_processed_pilot
+export RUN_DIR=/path/to/persistent/fmri_runs/nsd_pilot
+mkdir -p "$RUN_DIR"
+```
+
+Generate a deliberately small pilot manifest. A long stride selects at most
+one short window per run; at least two distinct subject/run groups are required
+for the training/validation split:
+
+```bash
+uv run python -m src.data_preprocessing.nsd.preprocess \
+  --raw-root "$NSD_RAW" \
+  --output-root "$NSD_PROCESSED" \
+  --subject subj01 \
+  --window-length 8 \
+  --stride 10000
+```
+
+Create manifests where the cluster data will live and keep that directory
+layout stable: the manifest records relative paths from the processed-data
+root to the raw BOLD files. Verify the groups, sample shape, and affine checks
+before submitting a GPU job.
+
+### 3. Create the training environment
+
+Run this in a shell with any required cluster Python/CUDA modules loaded:
+
+```bash
+bash scripts/cluster/setup_env.sh
+```
+
+This runs `uv sync --locked --python 3.12`, creating or updating the ignored
+`.venv/` from `uv.lock`. The project pins PyTorch, torchvision, and torchaudio
+to CUDA 12.4 wheels from the official PyTorch CUDA 12.4 package index. The
+setup script checks the PyTorch CUDA runtime version. A login node may not
+expose GPUs; the Slurm job checks the runtime version and GPU visibility again
+on the allocated GPU node. The cluster's NVIDIA driver must support CUDA 12.4.
+
+### 4. Adjust and submit the Slurm pilot
+
+Review `scripts/cluster/nsd_pilot.slurm` before submitting. Its example request
+uses one GPU, four CPUs, 32 GB of memory, and two hours. Change the GPU
+directive (`--gres=gpu:1`), partition/account, time, CPUs, and memory as
+required by your cluster.
+
+Submit from the repository root with the data and output paths exported:
+
+```bash
+sbatch \
+  --export=ALL,NSD_PROCESSED="$NSD_PROCESSED",RUN_DIR="$RUN_DIR",PILOT_TIME_FRAMES=8,PILOT_EPOCHS=1 \
+  scripts/cluster/nsd_pilot.slurm
+```
+
+The job verifies CUDA, loads one real window, checks that there are at least
+two subject/run groups, and runs the normal `src.train_nsd` model for one
+epoch. It writes Slurm output files in the submission directory and saves
+checkpoints and visualizations under `$RUN_DIR`. This is a small-data
+integration/resource pilot, not evidence of scientific denoising performance.
+
+Check job status and outputs using the cluster's Slurm tools (typically
+`squeue`, `sacct`, and the `slurm-*.out` log). Keep the output directory
+persistent. W&B is not enabled by this script unless configured separately;
+the current trainer's default logging behavior should be checked to ensure the
+metrics you need are persisted.
 
 ## Tests and diagnostics
 
