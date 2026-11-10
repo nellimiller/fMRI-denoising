@@ -65,4 +65,7 @@ uv run --no-sync python -m src.train_nsd \
     --num_workers "${PILOT_NUM_WORKERS:-2}" \
     --precision "${PILOT_PRECISION:-16-mixed}" \
     --checkpoint_dir "$RUN_DIR/checkpoints" \
-    --visualization_dir "$RUN_DIR/visualizations"
+    --visualization_dir "$RUN_DIR/visualizations" \
+    --use_wandb \
+    --project "7T-fMRI-Denoising" \
+    --name "nsd-full-settings-one-epoch"
