@@ -40,8 +40,9 @@ for validation_subject in "${VALIDATION_SUBJECTS[@]}"; do
     fi
 done
 
-DATA_SUBJECTS=("${TRAIN_SUBJECTS[@]}" "${VALIDATION_SUBJECTS[@]}")
-export DATA_SUBJECTS="${DATA_SUBJECTS[*]}"
+ALL_SUBJECTS=("${TRAIN_SUBJECTS[@]}" "${VALIDATION_SUBJECTS[@]}")
+DATA_SUBJECTS="${ALL_SUBJECTS[*]}"
+export DATA_SUBJECTS
 
 mkdir -p "$RUN_DIR/checkpoints" "$RUN_DIR/visualizations" "$RUN_DIR/logs"
 
@@ -97,7 +98,7 @@ echo "Held-out subjects not used in this run remain available for final evaluati
 
 uv run --no-sync python -m src.train_nsd \
     --data_dir "$NSD_PROCESSED" \
-    --subjects "${DATA_SUBJECTS[@]}" \
+    --subjects "${ALL_SUBJECTS[@]}" \
     --validation_subjects "${VALIDATION_SUBJECTS[@]}" \
     --time_frames "${TRAIN_TIME_FRAMES:-40}" \
     --batch_size "${TRAIN_BATCH_SIZE:-1}" \
