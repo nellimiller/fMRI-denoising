@@ -35,7 +35,7 @@ if [[ -n "${PILOT_VALIDATION_SUBJECTS:-}" ]]; then
 fi
 
 if ! command -v uv >/dev/null 2>&1; then
-    echo "uv was not found. Load or install uv using your cluster's instructions." >&2
+    echo "uv was not found. Load the cluster's uv module or add its install directory to PATH." >&2
     exit 1
 fi
 
@@ -46,8 +46,7 @@ mkdir -p "$RUN_DIR/checkpoints" "$RUN_DIR/visualizations" "$RUN_DIR/logs"
 
 uv run --no-sync python -c '
 import torch
-if torch.version.cuda != "12.4":
-    raise SystemExit(f"Expected PyTorch CUDA 12.4, found {torch.version.cuda!r}")
+print(f"PyTorch: {torch.__version__}; CUDA runtime: {torch.version.cuda}")
 if not torch.cuda.is_available():
     raise SystemExit("CUDA is unavailable in this Slurm job.")
 print(f"GPU: {torch.cuda.get_device_name(0)}")

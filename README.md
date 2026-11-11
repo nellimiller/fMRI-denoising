@@ -29,10 +29,11 @@ The project requires Python 3.13 or newer and uses `uv`:
 uv sync
 ```
 
-The training environment pins PyTorch 2.6.0, torchvision 0.21.0, and
-torchaudio 2.6.0 to their CUDA 12.4 builds. The CUDA runtime is bundled with
-these PyTorch wheels; the cluster still needs an NVIDIA driver compatible
-with CUDA 12.4. See the Slurm setup below for environment and GPU checks.
+The project installs PyTorch from the default Python package index, without
+forcing a particular CUDA build. `uv.lock` records the resolved packages;
+the NVIDIA driver on the cluster must support the CUDA runtime bundled with
+the selected PyTorch wheel. The Slurm job checks that CUDA is available on its
+allocated GPU.
 
 ## NSD workflow
 
@@ -285,20 +286,38 @@ root to the raw BOLD files. Verify the groups, sample shape, and affine checks
 before submitting a GPU job. The pilot job refuses to start if a requested
 subject manifest is missing or has no windows.
 
-### 3. Create the training environment
+### 3. Install uv and create the training environment
 
-Run this in a shell with any required cluster Python/CUDA modules loaded:
+Load the cluster's Python 3.13 module and, if available, its `uv` module.
+Confirm the Python version:
+
+```bash
+python3 --version
+```
+
+If `uv` is not provided as a module, install it in your user account using the
+official installer, then add its default install location to `PATH`:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
+If the cluster blocks downloads, ask the administrator for its approved `uv`
+installation method. Once Python 3.13 and `uv` are available, create the
+environment from the repository root:
 
 ```bash
 bash scripts/cluster/setup_env.sh
 ```
 
 This runs `uv sync --locked --python 3.13`, creating or updating the ignored
-`.venv/` from `uv.lock`. The project pins PyTorch, torchvision, and torchaudio
-to CUDA 12.4 wheels from the official PyTorch CUDA 12.4 package index. The
-setup script checks the PyTorch CUDA runtime version. A login node may not
-expose GPUs; the Slurm job checks the runtime version and GPU visibility again
-on the allocated GPU node. The cluster's NVIDIA driver must support CUDA 12.4.
+`.venv/` from `uv.lock`. PyTorch is resolved from the default package index;
+there is no CUDA 12.4-only index or version pin. The installed wheel includes
+its CUDA runtime dependencies, and the cluster's NVIDIA driver must support
+that runtime. The login node need not expose GPUs; the pilot verifies GPU
+visibility on the allocated compute node.
 
 ### 4. Adjust and submit the Slurm pilot
 
