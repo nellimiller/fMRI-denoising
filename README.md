@@ -267,24 +267,23 @@ Generate a deliberately small pilot manifest for **each** subject. A fresh
 processed directory avoids mixing manifests with different window lengths.
 The long stride selects at most one short window per run; the full eight-subject
 set must still have at least two distinct subject/run groups for the
-training/validation split:
+training/validation split. House rules require computations to run as Slurm
+jobs, so submit preprocessing as a CPU job (do not run this loop on the login
+node):
 
 ```bash
-for subject in subj01 subj02 subj03 subj04 subj05 subj06 subj07 subj08; do
-  uv run python -m src.data_preprocessing.nsd.preprocess \
-    --raw-root "$NSD_RAW" \
-    --output-root "$NSD_PROCESSED" \
-    --subject "$subject" \
-    --window-length 8 \
-    --stride 10000
-done
+PREP_JOB_ID=$(sbatch --parsable \
+  --export=ALL,NSD_RAW="$NSD_RAW",NSD_PROCESSED="$NSD_PROCESSED",PILOT_TIME_FRAMES=8,PILOT_STRIDE=10000 \
+  scripts/cluster/nsd_preprocess_pilot.slurm)
+PREP_JOB_ID="${PREP_JOB_ID%%;*}"
+echo "Preprocessing job: $PREP_JOB_ID"
 ```
 
 Create manifests where the cluster data will live and keep that directory
 layout stable: the manifest records relative paths from the processed-data
-root to the raw BOLD files. Verify the groups, sample shape, and affine checks
-before submitting a GPU job. The pilot job refuses to start if a requested
-subject manifest is missing or has no windows.
+root to the raw BOLD files. The preprocessing job writes one manifest per
+subject and validates image geometry. The training job refuses to start if a
+requested subject manifest is missing or has no windows.
 
 ### 3. Install uv and create the training environment
 
@@ -324,14 +323,21 @@ visibility on the allocated compute node.
 Review `scripts/cluster/nsd_pilot.slurm` before submitting. Its example request
 uses one GPU, four CPUs, 32 GB of memory, and two hours. Change the GPU
 directive (`--gres=gpu:1`), partition/account, time, CPUs, and memory as
-required by your cluster.
+required by your cluster. The preprocessing job in
+`scripts/cluster/nsd_preprocess_pilot.slurm` requests four CPUs, 32 GB of
+memory, and four hours; adjust those directives to your cluster as well.
 
-Submit from the repository root with the data and output paths exported:
+Submit the GPU pilot as a dependent job, so it only starts if preprocessing
+completes successfully. These commands submit jobs; the data preprocessing and
+training themselves run on Slurm compute nodes:
 
 ```bash
-sbatch \
+PILOT_JOB_ID=$(sbatch --parsable \
+  --dependency="afterok:$PREP_JOB_ID" \
   --export=ALL,NSD_PROCESSED="$NSD_PROCESSED",RUN_DIR="$RUN_DIR",PILOT_TIME_FRAMES=8,PILOT_EPOCHS=1,PILOT_VALIDATION_SUBJECTS=subj08 \
-  scripts/cluster/nsd_pilot.slurm
+  scripts/cluster/nsd_pilot.slurm)
+PILOT_JOB_ID="${PILOT_JOB_ID%%;*}"
+echo "Training job: $PILOT_JOB_ID (after preprocessing job $PREP_JOB_ID)"
 ```
 
 By default, the job verifies all eight manifests and CUDA visibility, loads a
@@ -362,10 +368,11 @@ reach W&B and is authenticated before submission (for example, configure
 existing W&B login). Set `PILOT_WANDB_PROJECT` to override the project name.
 The regular training entry point can likewise opt into W&B with `--use_wandb`.
 
-Check job status and outputs using the cluster's Slurm tools (typically
-`squeue`, `sacct`, and the `slurm-*.out` log). Keep the output directory
-persistent. The training split uses unseen subjects for validation. Without
-clean ground-truth fMRI, validation loss measures reconstruction and
+Check both job statuses and outputs using the cluster's Slurm tools (typically
+`squeue`, `sacct`, and the `slurm-*.out` logs). Keep the output directory
+persistent. If preprocessing fails, Slurm will leave the dependent training
+job unstarted. The training split uses unseen subjects for validation.
+Without clean ground-truth fMRI, validation loss measures reconstruction and
 consistency, not denoising accuracy; see the evaluation notes above before
 interpreting it scientifically.
 

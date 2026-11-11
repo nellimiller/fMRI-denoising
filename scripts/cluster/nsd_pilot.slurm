@@ -13,6 +13,7 @@ set -euo pipefail
 
 REPO_DIR="${SLURM_SUBMIT_DIR:?Submit this job from the repository root}"
 cd "$REPO_DIR"
+export PATH="$HOME/.local/bin:$PATH"
 
 : "${NSD_PROCESSED:?Set NSD_PROCESSED to the processed NSD manifest directory}"
 : "${RUN_DIR:?Set RUN_DIR to persistent output storage}"
