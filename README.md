@@ -376,6 +376,71 @@ Without clean ground-truth fMRI, validation loss measures reconstruction and
 consistency, not denoising accuracy; see the evaluation notes above before
 interpreting it scientifically.
 
+### Full training after the pilot
+
+The one-epoch pilot checked execution, but its short windows and small model
+are not a full training run. The separate `scripts/cluster/nsd_train.slurm`
+uses the regular model defaults (`patch_size=14`, `embed_dim=96`), 40-frame
+windows, batch size 1, and 100 epochs. It defaults to subjects 1-6 for
+training and subject 7 for validation; subject 8 is not loaded, leaving it
+available for a later final test. Change the split only before starting the
+run, and choose a held-out test subject distinct from the validation subjects.
+
+Preprocess a fresh full-window directory using a Slurm CPU job. The stride of
+20 creates overlapping windows; this can produce many more samples than the
+pilot, so check the preprocessing duration and storage:
+
+```bash
+export FULL_PROCESSED=/hpc/faststorage/miller/fMRI-denoising/nsd_processed_40f_s20
+export FULL_RUN_DIR=/hpc/faststorage/miller/fMRI-denoising/runs/nsd_full_40f
+mkdir -p "$FULL_RUN_DIR/logs/slurm"
+
+FULL_PREP_JOB_ID=$(sbatch --parsable \
+  --output="$FULL_RUN_DIR/logs/slurm/preprocess-%j.out" \
+  --error="$FULL_RUN_DIR/logs/slurm/preprocess-%j.err" \
+  --export=ALL,NSD_RAW="$NSD_RAW",NSD_PROCESSED="$FULL_PROCESSED",PILOT_TIME_FRAMES=40,PILOT_STRIDE=20 \
+  scripts/cluster/nsd_preprocess_pilot.slurm)
+FULL_PREP_JOB_ID="${FULL_PREP_JOB_ID%%;*}"
+echo "Full-window preprocessing job: $FULL_PREP_JOB_ID"
+```
+
+Once submitted, preprocessing runs on the compute node. The following
+dependent training job will not start unless preprocessing succeeds. Ensure
+W&B credentials are available to the job through the cluster-approved method:
+
+```bash
+FULL_TRAIN_JOB_ID=$(sbatch --parsable \
+  --dependency="afterok:$FULL_PREP_JOB_ID" \
+  --output="$FULL_RUN_DIR/logs/slurm/train-%j.out" \
+  --error="$FULL_RUN_DIR/logs/slurm/train-%j.err" \
+  --export=ALL,NSD_PROCESSED="$FULL_PROCESSED",RUN_DIR="$FULL_RUN_DIR",TRAIN_SUBJECTS="subj01 subj02 subj03 subj04 subj05 subj06",VALIDATION_SUBJECTS=subj07,TRAIN_TIME_FRAMES=40,TRAIN_EPOCHS=100 \
+  scripts/cluster/nsd_train.slurm)
+FULL_TRAIN_JOB_ID="${FULL_TRAIN_JOB_ID%%;*}"
+echo "Full training job: $FULL_TRAIN_JOB_ID"
+```
+
+The 100-epoch default is a starting configuration, not a runtime estimate.
+Ask for a wall-time limit supported by the cluster and watch epoch duration.
+The learning-rate cosine schedule uses the configured epoch count, so set
+`TRAIN_EPOCHS` to the intended total before starting. If the job reaches its
+time limit, it currently does not automatically resume from a checkpoint;
+do not assume that a checkpoint is a resumable run without explicitly
+continuing with the intended checkpoint path.
+
+Monitor both jobs with:
+
+```bash
+squeue -j "$FULL_PREP_JOB_ID,$FULL_TRAIN_JOB_ID" -o "%.18i %.24j %.8T %.10M %R"
+sacct -j "$FULL_PREP_JOB_ID,$FULL_TRAIN_JOB_ID" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS
+tail -f "$FULL_RUN_DIR/logs/slurm/train-${FULL_TRAIN_JOB_ID}.out"
+```
+
+Training checkpoints are under `$FULL_RUN_DIR/checkpoints`, local CSV metrics
+under `$FULL_RUN_DIR/logs`, validation panels under
+`$FULL_RUN_DIR/visualizations`, and W&B metrics in the configured project.
+Inspect validation curves and outputs before treating this as a useful model;
+successful completion alone is not evidence of denoising quality.
+
 ## Tests and diagnostics
 
 Run the automated tests with:
