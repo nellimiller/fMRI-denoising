@@ -23,7 +23,7 @@ the component metrics and visualizations before drawing conclusions.
 
 ## Environment
 
-The project requires Python 3.12 or newer and uses `uv`:
+The project requires Python 3.13 or newer and uses `uv`:
 
 ```powershell
 uv sync
@@ -248,7 +248,7 @@ Run this in a shell with any required cluster Python/CUDA modules loaded:
 bash scripts/cluster/setup_env.sh
 ```
 
-This runs `uv sync --locked --python 3.12`, creating or updating the ignored
+This runs `uv sync --locked --python 3.13`, creating or updating the ignored
 `.venv/` from `uv.lock`. The project pins PyTorch, torchvision, and torchaudio
 to CUDA 12.4 wheels from the official PyTorch CUDA 12.4 package index. The
 setup script checks the PyTorch CUDA runtime version. A login node may not

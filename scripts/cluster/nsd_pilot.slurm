@@ -28,7 +28,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # Load the cluster's Python/CUDA modules here if required, for example:
-# module load python/3.12 cuda
+# module load python/3.13 cuda
 
 mkdir -p "$RUN_DIR/checkpoints" "$RUN_DIR/visualizations"
 
