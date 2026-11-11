@@ -219,3 +219,7 @@ __marimo__/
 
 # Notes
 notes.txt
+
+# Folder on Cluster
+runs/
+wandb/
