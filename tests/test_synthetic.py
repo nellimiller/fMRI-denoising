@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, random_split
 
 from data.synthetic import SyntheticNSDDataset
 from models.lightning_model import fMRIDenoisingLightning
+from train_nsd import NSDDataModule
 from utils.visualization import crop_to_input
 
 
@@ -102,3 +103,31 @@ def test_training_smoke_cpu() -> None:
     # or OOM errors), the core pipeline geometry is functionally sound.
     # Should run without raising
     trainer.fit(model, datamodule=dm)
+
+
+def test_nsd_split_holds_out_complete_subjects(monkeypatch) -> None:
+    class FakeNSDDataset:
+        def __init__(self, *args, **kwargs) -> None:
+            self.entries = [
+                {"subject": subject, "run": f"run{run}"}
+                for subject in ("subj01", "subj02", "subj03")
+                for run in (1, 2)
+            ]
+
+        def __len__(self) -> int:
+            return len(self.entries)
+
+    monkeypatch.setattr("train_nsd.NSDDataset", FakeNSDDataset)
+    datamodule = NSDDataModule("unused", validation_subjects=["subj03"])
+    datamodule.setup()
+
+    train_subjects = {
+        datamodule.full_dataset.entries[index]["subject"]
+        for index in datamodule.train_set.indices
+    }
+    val_subjects = {
+        datamodule.full_dataset.entries[index]["subject"]
+        for index in datamodule.val_set.indices
+    }
+    assert train_subjects == {"subj01", "subj02"}
+    assert val_subjects == {"subj03"}

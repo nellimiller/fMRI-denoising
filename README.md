@@ -85,20 +85,27 @@ uv run python -m src.train_nsd `
   --precision 32-true
 ```
 
-The data module keeps complete subject/run groups on one side of the
-train/validation split to avoid leakage between overlapping windows. At least
-two distinct subject/run groups are needed. Note that the default patch size
-and three encoder merges impose a minimum padded grid of 112 voxels per spatial
-axis, so crops smaller than that do not necessarily reduce model memory.
+The data module holds out complete subjects for validation, so no windows from
+a validation subject are used for gradient updates. By default, a seeded
+20%-of-subjects split is used; set `--validation_subjects subj08` to choose the
+held-out subject explicitly (the IDs must also be included in `--subjects`, if
+that option is set). At least two subjects are required. Note that the default
+patch size and three encoder merges impose a minimum padded grid of 112 voxels
+per spatial axis, so crops smaller than that do not necessarily reduce model
+memory.
 
 Useful options include:
 
 | Option | Purpose |
 | --- | --- |
 | `--seed` | Seed model, split, and worker initialization (default `1234`). |
+| `--subjects` | Subject IDs to include; by default all manifests are loaded. |
+| `--validation_subjects` | Explicit subject IDs to reserve for validation. |
 | `--crop_size X Y Z` | Crop the volume around the tissue-mask center. |
+| `--patch_size` / `--embed_dim` | Model capacity; defaults are `14` / `96`. |
 | `--precision` | Lightning precision mode; use `32-true` for a conservative smoke run. |
 | `--gradient_clip_val` | Clip gradient norm (default `1.0`). |
+| `--log_dir` | Persist CSV metrics (default `logs_nsd/`). |
 | `--checkpoint_dir` | Save best validation and latest checkpoints. |
 | `--visualization_dir` | Save validation slice panels. |
 | `--use_wandb` | Enable Weights & Biases metric logging. |
@@ -181,7 +188,7 @@ Before a longer run, check that:
 - losses and gradients remain finite;
 - the clean and noise heads both have nontrivial energy;
 - the total reconstruction and residuals look plausible in the saved panels;
-- validation performance is interpreted at the subject/run split level.
+- validation performance is interpreted at the subject split level.
 
 ## Slurm cluster pilot
 
@@ -217,28 +224,33 @@ On the cluster, define the raw-data, processed-data, and persistent-run paths:
 
 ```bash
 export NSD_RAW=/path/to/nsd_data
-export NSD_PROCESSED=/path/to/nsd_processed_pilot
+export NSD_PROCESSED=/path/to/nsd_processed_pilot_8subjects
 export RUN_DIR=/path/to/persistent/fmri_runs/nsd_pilot
 mkdir -p "$RUN_DIR"
 ```
 
-Generate a deliberately small pilot manifest. A long stride selects at most
-one short window per run; at least two distinct subject/run groups are required
-for the training/validation split:
+Generate a deliberately small pilot manifest for **each** subject. A fresh
+processed directory avoids mixing manifests with different window lengths.
+The long stride selects at most one short window per run; the full eight-subject
+set must still have at least two distinct subject/run groups for the
+training/validation split:
 
 ```bash
-uv run python -m src.data_preprocessing.nsd.preprocess \
-  --raw-root "$NSD_RAW" \
-  --output-root "$NSD_PROCESSED" \
-  --subject subj01 \
-  --window-length 8 \
-  --stride 10000
+for subject in subj01 subj02 subj03 subj04 subj05 subj06 subj07 subj08; do
+  uv run python -m src.data_preprocessing.nsd.preprocess \
+    --raw-root "$NSD_RAW" \
+    --output-root "$NSD_PROCESSED" \
+    --subject "$subject" \
+    --window-length 8 \
+    --stride 10000
+done
 ```
 
 Create manifests where the cluster data will live and keep that directory
 layout stable: the manifest records relative paths from the processed-data
 root to the raw BOLD files. Verify the groups, sample shape, and affine checks
-before submitting a GPU job.
+before submitting a GPU job. The pilot job refuses to start if a requested
+subject manifest is missing or has no windows.
 
 ### 3. Create the training environment
 
@@ -266,21 +278,44 @@ Submit from the repository root with the data and output paths exported:
 
 ```bash
 sbatch \
-  --export=ALL,NSD_PROCESSED="$NSD_PROCESSED",RUN_DIR="$RUN_DIR",PILOT_TIME_FRAMES=8,PILOT_EPOCHS=1 \
+  --export=ALL,NSD_PROCESSED="$NSD_PROCESSED",RUN_DIR="$RUN_DIR",PILOT_TIME_FRAMES=8,PILOT_EPOCHS=1,PILOT_VALIDATION_SUBJECTS=subj08 \
   scripts/cluster/nsd_pilot.slurm
 ```
 
-The job verifies CUDA, loads one real window, checks that there are at least
-two subject/run groups, and runs the normal `src.train_nsd` model for one
-epoch. It writes Slurm output files in the submission directory and saves
-checkpoints and visualizations under `$RUN_DIR`. This is a small-data
-integration/resource pilot, not evidence of scientific denoising performance.
+By default, the job verifies all eight manifests and CUDA visibility, loads a
+real sample, and trains one epoch over the requested subjects. For this
+resource/integration pilot it uses an 8-frame window, a 32-voxel cube,
+`patch_size=4`, and `embed_dim=24` (override with `PILOT_*` variables as
+needed). The default seeded split reserves two subjects for validation; set
+`PILOT_VALIDATION_SUBJECTS=subj08` to hold out one specific subject. This is
+intentionally a smaller model than the normal training
+defaults (`patch_size=14`, `embed_dim=96`); do not use its checkpoint as a
+production checkpoint. It checks end-to-end data loading, optimization,
+validation, checkpointing, visualization, and metric writing, but does not
+establish denoising performance.
+
+Expected outputs include:
+
+- `$RUN_DIR/checkpoints/last.ckpt` and a best-validation checkpoint selected
+  by `val_total`.
+- `$RUN_DIR/visualizations/validation_epoch_0000.png`.
+- CSV metrics under
+  `$RUN_DIR/logs/nsd-8subject-one-epoch/version_N/metrics.csv` (`version_0`
+  for a fresh run directory).
+- `slurm-fmri-nsd-pilot-<job-id>.out` and `.err` in the submission directory.
+
+The pilot enables W&B as well as local CSV metrics. Ensure the cluster job can
+reach W&B and is authenticated before submission (for example, configure
+`WANDB_API_KEY` through the cluster's approved secret mechanism, or use an
+existing W&B login). Set `PILOT_WANDB_PROJECT` to override the project name.
+The regular training entry point can likewise opt into W&B with `--use_wandb`.
 
 Check job status and outputs using the cluster's Slurm tools (typically
 `squeue`, `sacct`, and the `slurm-*.out` log). Keep the output directory
-persistent. W&B is not enabled by this script unless configured separately;
-the current trainer's default logging behavior should be checked to ensure the
-metrics you need are persisted.
+persistent. The training split uses unseen subjects for validation. Without
+clean ground-truth fMRI, validation loss measures reconstruction and
+consistency, not denoising accuracy; see the evaluation notes above before
+interpreting it scientifically.
 
 ## Tests and diagnostics
 

@@ -15,7 +15,7 @@ from pathlib import Path
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader, Subset
 
 try:
@@ -36,8 +36,9 @@ class NSDDataModule(L.LightningDataModule):
         batch_size: Number of temporal windows per batch. Defaults to 1 due to 4D tensor size.
         time_frames: Sequence length (T) for the sliding window. Defaults to 40.
         num_workers: Subprocesses for data loading.
-        val_split: Fraction of the dataset reserved for validation.
+        val_split: Fraction of subjects reserved for validation.
         subjects: Optional list of specific subject IDs to load (e.g., ["subj01"]).
+        validation_subjects: Optional subject IDs to hold out from training.
     """
     def __init__(
         self,
@@ -47,6 +48,7 @@ class NSDDataModule(L.LightningDataModule):
         num_workers: int = 4,
         val_split: float = 0.2,
         subjects: list[str] | None = None,
+        validation_subjects: list[str] | None = None,
         crop_size: tuple[int, int, int] | None = None,
         seed: int = 1234,
     ) -> None:
@@ -58,6 +60,7 @@ class NSDDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.val_split = val_split
         self.subjects = subjects
+        self.validation_subjects = validation_subjects
         self.crop_size = crop_size
         self.seed = seed
 
@@ -74,22 +77,49 @@ class NSDDataModule(L.LightningDataModule):
         if total_len == 0:
             raise RuntimeError(f"No subjects found in {self.data_dir}")
 
-        groups: dict[tuple[str, str], list[int]] = {}
+        subject_indices: dict[str, list[int]] = {}
         for index, entry in enumerate(self.full_dataset.entries):
-            key = (str(entry["subject"]), str(entry["run"]))
-            groups.setdefault(key, []).append(index)
+            subject_indices.setdefault(str(entry["subject"]), []).append(index)
 
-        generator = torch.Generator().manual_seed(self.seed)
-        group_keys = list(groups)
-        if len(group_keys) < 2:
-            raise ValueError("At least two subject/run groups are required for validation.")
-        permutation = torch.randperm(len(group_keys), generator=generator).tolist()
-        val_groups = min(len(group_keys) - 1, max(1, round(len(group_keys) * self.val_split)))
-        val_keys = {group_keys[i] for i in permutation[:val_groups]}
-        val_indices = [i for key, indices in groups.items() if key in val_keys for i in indices]
-        train_indices = [i for key, indices in groups.items() if key not in val_keys for i in indices]
+        available_subjects = sorted(subject_indices)
+        if len(available_subjects) < 2:
+            raise ValueError("At least two subjects are required for unseen-subject validation.")
+
+        if self.validation_subjects is not None:
+            val_subjects = set(self.validation_subjects)
+            missing_subjects = val_subjects - set(available_subjects)
+            if missing_subjects:
+                raise ValueError(
+                    f"Validation subjects have no dataset windows: {sorted(missing_subjects)}"
+                )
+            if not val_subjects or val_subjects == set(available_subjects):
+                raise ValueError("Validation must include at least one, but not all, subjects.")
+        else:
+            generator = torch.Generator().manual_seed(self.seed)
+            permutation = torch.randperm(len(available_subjects), generator=generator).tolist()
+            val_count = min(
+                len(available_subjects) - 1,
+                max(1, round(len(available_subjects) * self.val_split)),
+            )
+            val_subjects = {available_subjects[i] for i in permutation[:val_count]}
+
+        train_subjects = set(available_subjects) - val_subjects
+        val_indices = [
+            index
+            for subject in sorted(val_subjects)
+            for index in subject_indices[subject]
+        ]
+        train_indices = [
+            index
+            for subject in sorted(train_subjects)
+            for index in subject_indices[subject]
+        ]
         if not train_indices:
-            raise ValueError("The subject/run split left no training examples.")
+            raise ValueError("The subject split left no training examples.")
+        print(
+            f"Subject split: train={sorted(train_subjects)}; "
+            f"validation={sorted(val_subjects)}"
+        )
         self.train_set = Subset(self.full_dataset, train_indices)
         self.val_set = Subset(self.full_dataset, val_indices)
 
@@ -124,7 +154,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1.5e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--subjects", nargs="+", default=None, help="Subject IDs to load (default: all manifests)")
+    parser.add_argument(
+        "--validation_subjects",
+        nargs="+",
+        default=None,
+        help="Subjects held out entirely for validation (default: seeded subject-level split)",
+    )
     parser.add_argument("--crop_size", nargs=3, type=int, default=None)
+    parser.add_argument("--patch_size", type=int, default=14)
+    parser.add_argument("--embed_dim", type=int, default=96)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--precision", default="16-mixed")
 
@@ -132,6 +171,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--project", default="7T-fMRI-Denoising")
     parser.add_argument("--name", default="SwinMAE-NSD")
+    parser.add_argument("--log_dir", default="logs_nsd")
     parser.add_argument("--checkpoint_dir", default="checkpoints_nsd")
     parser.add_argument("--visualization_dir", default="validation_visualizations")
     parser.add_argument("--visualize_every_n_epochs", type=int, default=1)
@@ -152,6 +192,8 @@ def main() -> None:
         batch_size=args.batch_size,
         time_frames=args.time_frames,
         num_workers=args.num_workers,
+        subjects=args.subjects,
+        validation_subjects=args.validation_subjects,
         crop_size=tuple(args.crop_size) if args.crop_size else None,
         seed=args.seed,
     )
@@ -161,23 +203,25 @@ def main() -> None:
     print("Initializing model...")
     model = fMRIDenoisingLightning(
         in_chans=4,
-        patch_size=14,
-        embed_dim=96,
+        patch_size=args.patch_size,
+        embed_dim=args.embed_dim,
         mask_ratio=0.75,
         lr=args.lr,
     )
 
-    logger = None
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    loggers = [CSVLogger(save_dir=str(log_dir), name=args.name)]
     if args.use_wandb:
-        logger = WandbLogger(project=args.project, name=args.name, log_model="all")
+        loggers.append(WandbLogger(project=args.project, name=args.name))
 
-    # Saves the top 3 models based on lowest validation loss
+    # The Lightning module logs the combined objective as val_total.
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val_total",
         mode="min",
         save_top_k=3,
         dirpath=checkpoint_dir,
-        filename="swinmae-nsd-{epoch:02d}-{val_loss:.4f}",
+        filename="swinmae-nsd-{epoch:02d}-{val_total:.4f}",
         save_last=True,
     )
     visualization_callback = ValidationVisualizationCallback(
@@ -187,7 +231,7 @@ def main() -> None:
 
     trainer = L.Trainer(
         max_epochs=args.epochs,
-        logger=logger,
+        logger=loggers,
         callbacks=[checkpoint_callback, visualization_callback],
         accelerator="auto",
         devices="auto",
