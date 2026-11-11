@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, random_split
 from data.synthetic import SyntheticNSDDataset
 from models.lightning_model import fMRIDenoisingLightning
 from train_nsd import NSDDataModule
+from utils.losses import StructuralDenoisingLoss
 from utils.visualization import crop_to_input
 
 
@@ -33,6 +34,25 @@ def test_synthetic_dataset_shape() -> None:
 
     # Expected shape: [Channels (BOLD+GM+WM+CSF), Time, X, Y, Z]
     assert item.shape == (4, 8, 16, 16, 8)
+
+
+def test_structural_loss_fft_supports_half_precision_40_frames() -> None:
+    clean = torch.randn(1, 1, 40, 2, 2, 2, dtype=torch.float16, requires_grad=True)
+    noise = torch.randn_like(clean, requires_grad=True)
+    target_bold = torch.randn_like(clean)
+    gm = torch.ones_like(clean)
+    wm = torch.zeros_like(clean)
+    csf = torch.zeros_like(clean)
+    target = torch.cat((target_bold, gm, wm, csf), dim=1)
+
+    total, _, _, _, fft = StructuralDenoisingLoss()(clean, noise, target)
+
+    assert total.dtype == torch.float32
+    assert torch.isfinite(total)
+    assert torch.isfinite(fft)
+    total.backward()
+    assert clean.grad is not None and torch.isfinite(clean.grad).all()
+    assert noise.grad is not None and torch.isfinite(noise.grad).all()
 
 
 class SyntheticModule(L.LightningDataModule):

@@ -170,6 +170,8 @@ energy and the masked-token fraction. Checkpoints are written to
 `checkpoints_nsd/` by default. A validation slice panel for a fixed sample is
 saved to `validation_visualizations/` after each validation epoch; the
 randomized mask means the reconstruction may vary between epochs.
+The FFT component is calculated in float32 so mixed-precision training supports
+the default 40-frame sequence length on CUDA.
 
 ## Adding evaluation metrics
 

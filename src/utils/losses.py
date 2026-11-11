@@ -120,8 +120,10 @@ class StructuralDenoisingLoss(nn.Module):
         ortho_loss = gm_scores.pow(2).sum() / gm_count
 
         # 4. Fast Fourier Transform Loss (Spectrum Matching)
-        pred_fft = torch.fft.rfft(total_pred, dim=2)
-        target_fft = torch.fft.rfft(target_bold, dim=2)
+        # cuFFT does not support half-precision transforms for arbitrary lengths
+        # such as the default 40-frame window.
+        pred_fft = torch.fft.rfft(clean_pred.float() + noise_pred.float(), dim=2)
+        target_fft = torch.fft.rfft(target_bold.float(), dim=2)
         fft_loss = F.mse_loss(torch.abs(pred_fft), torch.abs(target_fft))
 
         total_loss = (
