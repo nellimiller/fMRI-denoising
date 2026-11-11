@@ -183,6 +183,39 @@ metadata such as TR. Without clean ground-truth fMRI, metrics against observed
 BOLD quantify reconstruction or consistency, not denoising accuracy; they do
 not prove that the clean output is noise-free.
 
+### Post-training evaluation with GLMdenoise beta maps
+
+Evaluation can be implemented and run after training; it does not have to be
+part of the optimization loop, and it need not change the unsupervised MAE
+objective. Decide the evaluation split and save the checkpoint, subject/run
+IDs, preprocessing details, and TR before a long run. The validation subject
+is used for checkpoint selection, so reserve a different, untouched test
+subject for final evaluation if reporting a held-out result. With eight
+subjects, a pilot could use six for training, one for validation, and one for
+testing; subject-level cross-validation can use the data more fully later.
+
+Single-trial GLMdenoise beta maps are not directly interchangeable with the
+model's input or output: the model takes 4D BOLD windows plus tissue masks and
+predicts time-series clean/noise components, whereas each beta map is a 3D
+trial coefficient. A reasonable external analysis is to apply a frozen model
+to held-out BOLD, form its clean time series, run the same trial GLM on those
+time series, and compare the resulting trial betas to the GLMdenoise beta
+maps. Keep trial design, scaling, registration, and voxel masks aligned. This
+measures agreement with a GLMdenoise-derived reference, not ground-truth
+denoising: the reference is itself estimated from fMRI and may share data and
+noise with the model input. Report map correlation and reliability alongside
+scale-sensitive errors, and compare against betas from the original BOLD and
+appropriate GLM baselines. Do not feed isolated beta volumes into this
+4D-temporal model as though they were BOLD frames.
+
+For unsupervised evaluation without beta targets, report held-out-subject
+masked reconstruction error and residuals, temporal/spectral summaries,
+clean/noise energy and stability across seeds, plus visual checks in GM, WM,
+and CSF. These are reconstruction/consistency diagnostics, not evidence that
+the clean head is biologically clean: only the sum of the two heads is directly
+constrained by reconstruction, so their decomposition is not identifiable
+from the current objective alone.
+
 Before a longer run, check that:
 
 - losses and gradients remain finite;
