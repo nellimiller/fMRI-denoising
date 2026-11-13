@@ -118,6 +118,13 @@ def _safe_filename(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value)
 
 
+def _sample_spatiotemporal_shape(sample: torch.Tensor) -> tuple[int, int, int, int]:
+    if sample.ndim != 5:
+        raise ValueError(f"Expected sample [C, T, X, Y, Z], got shape {tuple(sample.shape)}.")
+    _, time, x_size, y_size, z_size = sample.shape
+    return time, x_size, y_size, z_size
+
+
 def _select_visual_indices(
     entries: list[dict[str, Any]],
     examples_per_subject: int,
@@ -384,7 +391,7 @@ def main() -> None:
                     sample.unsqueeze(0),
                     tube_masking=True,
                 )
-                time, _, x_size, y_size, z_size = sample.shape
+                time, x_size, y_size, z_size = _sample_spatiotemporal_shape(sample)
                 prediction = prediction[0, 0, :time, :x_size, :y_size, :z_size]
                 clean = clean[0, 0, :time, :x_size, :y_size, :z_size]
                 noise = noise[0, 0, :time, :x_size, :y_size, :z_size]

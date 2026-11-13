@@ -6,6 +6,7 @@ from evaluate_nsd import (
     METRIC_NAMES,
     _aggregate,
     _masked_voxel_grid,
+    _sample_spatiotemporal_shape,
     _save_visualization,
     _select_visual_indices,
 )
@@ -21,6 +22,12 @@ def test_masked_voxel_grid_expands_tube_mask_and_crops_padding() -> None:
     assert voxels.shape == shape
     assert int(voxels.sum()) == 16
     assert torch.equal(voxels[0], voxels[1])
+
+
+def test_sample_shape_uses_time_dimension_not_channel_count() -> None:
+    sample = torch.empty(4, 40, 8, 16, 24)
+
+    assert _sample_spatiotemporal_shape(sample) == (40, 8, 16, 24)
 
 
 def test_aggregate_groups_windows_by_subject_and_run() -> None:
