@@ -219,6 +219,44 @@ the clean head is biologically clean: only the sum of the two heads is directly
 constrained by reconstruction, so their decomposition is not identifiable
 from the current objective alone.
 
+### Run held-out evaluation on Slurm
+
+After training, choose a best-validation checkpoint and a test subject that
+was not used for training or validation. From the repository root, set the
+processed-data path, checkpoint, and persistent output directory, then submit
+the evaluation job. The defaults evaluate `subj08` with 40-frame windows:
+
+```bash
+export NSD_PROCESSED=/path/to/nsd_processed_40f_s20
+export CHECKPOINT=/path/to/run/checkpoints/best-validation-checkpoint.ckpt
+export EVAL_DIR=/path/to/persistent/evaluations/nsd_test
+export EVAL_SUBJECTS=subj08
+
+sbatch scripts/cluster/nsd_evaluate.slurm
+```
+
+The evaluator loads model hyperparameters from the Lightning checkpoint and
+writes `metrics_by_window.csv`, `metrics_by_run.csv`,
+`metrics_by_subject.csv`, and `summary.json` to `EVAL_DIR`. It also saves up
+to three example slice panels per subject under `EVAL_DIR/visualizations/`.
+Each panel shows observed BOLD, the predicted clean head, reconstruction,
+noise head, reconstruction residual, and GM/WM/CSF masks. Input, clean, and
+reconstruction panels use the same intensity scale. The predicted clean head
+is an experimental output, not a validated clean-signal estimate. Examples
+are selected across each subject's windows and show the middle time point on
+the axial slice with the most tissue-mask voxels.
+
+Metrics include full and masked MSE/MAE/RMSE and correlation, tissue-specific
+MSE, and clean and noise output energy. The run and subject summaries average
+windows and runs respectively; the overall summary averages subjects equally.
+Use `EVAL_TIME_FRAMES` and optional `EVAL_CROP_SIZE="X Y Z"` to match the
+preprocessed windows and training crop, `EVAL_MASK_REPEATS` to average
+different deterministic tube-mask draws, `EVAL_SEED` to choose their
+reproducible seed, and `EVAL_VISUAL_EXAMPLES_PER_SUBJECT` to change the number
+of panels (set it to `0` to disable). These remain
+reconstruction/consistency metrics against observed BOLD, not measures of
+clean-signal recovery.
+
 Before a longer run, check that:
 
 - losses and gradients remain finite;
