@@ -19,7 +19,7 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 try:
     from .data.nsd_dataset import NSDDataset
@@ -51,6 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", required=True, help="Processed NSD root containing subject manifests")
     parser.add_argument("--checkpoint", required=True, help="Lightning checkpoint to evaluate")
     parser.add_argument("--subjects", nargs="+", required=True, help="Held-out subject IDs")
+    parser.add_argument(
+        "--train_visual_subjects",
+        nargs="*",
+        default=[],
+        help="Training subjects to visualize only; excluded from evaluation metrics",
+    )
+    parser.add_argument(
+        "--validation_visual_subjects",
+        nargs="*",
+        default=[],
+        help="Validation subjects to visualize only; excluded from evaluation metrics",
+    )
     parser.add_argument("--output_dir", required=True, help="Directory for CSV and JSON metrics")
     parser.add_argument("--time_frames", type=int, default=40)
     parser.add_argument("--crop_size", nargs=3, type=int, default=None)
@@ -109,10 +121,13 @@ def _safe_filename(value: str) -> str:
 def _select_visual_indices(
     entries: list[dict[str, Any]],
     examples_per_subject: int,
+    subjects: set[str] | None = None,
 ) -> set[int]:
     indices_by_subject: dict[str, list[int]] = defaultdict(list)
     for index, entry in enumerate(entries):
-        indices_by_subject[str(entry["subject"])].append(index)
+        subject = str(entry["subject"])
+        if subjects is None or subject in subjects:
+            indices_by_subject[subject].append(index)
 
     selected: set[int] = set()
     for indices in indices_by_subject.values():
@@ -300,20 +315,47 @@ def main() -> None:
     model.to(device).eval()
     patch_size = int(model.hparams.patch_size)
 
+    evaluation_subjects = set(args.subjects)
+    train_visual_subjects = set(args.train_visual_subjects)
+    validation_visual_subjects = set(args.validation_visual_subjects)
+    if evaluation_subjects & train_visual_subjects:
+        raise ValueError("Test subjects cannot also be listed as training visualization subjects.")
+    if evaluation_subjects & validation_visual_subjects:
+        raise ValueError("Test subjects cannot also be listed as validation visualization subjects.")
+    if train_visual_subjects & validation_visual_subjects:
+        raise ValueError("A subject cannot be both a training and validation visualization subject.")
+
+    all_subjects = evaluation_subjects | train_visual_subjects | validation_visual_subjects
     dataset = NSDDataset(
         args.data_dir,
-        subjects=args.subjects,
+        subjects=sorted(all_subjects),
         time_frames=args.time_frames,
         crop_size=tuple(args.crop_size) if args.crop_size else None,
     )
-    requested_subjects = set(args.subjects)
+    requested_subjects = all_subjects
     loaded_subjects = {str(entry["subject"]) for entry in dataset.entries}
     missing_subjects = requested_subjects - loaded_subjects
     if missing_subjects:
         raise ValueError(f"Requested subjects have no dataset windows: {sorted(missing_subjects)}")
 
+    visual_roles = {subject: "test" for subject in evaluation_subjects}
+    visual_roles.update({subject: "train" for subject in train_visual_subjects})
+    visual_roles.update({subject: "validation" for subject in validation_visual_subjects})
+    visual_subjects = set(visual_roles) if args.visual_examples_per_subject else set()
+    evaluation_indices = {
+        index
+        for index, entry in enumerate(dataset.entries)
+        if str(entry["subject"]) in evaluation_subjects
+    }
+    visual_indices = _select_visual_indices(
+        dataset.entries,
+        args.visual_examples_per_subject,
+        visual_subjects,
+    )
+    selected_indices = sorted(evaluation_indices | visual_indices)
+
     loader = DataLoader(
-        dataset,
+        Subset(dataset, selected_indices),
         batch_size=1,
         shuffle=False,
         num_workers=args.num_workers,
@@ -321,23 +363,22 @@ def main() -> None:
     )
     output_dir = Path(args.output_dir)
     visualization_dir = output_dir / "visualizations"
-    if args.visual_examples_per_subject:
-        visualization_dir.mkdir(parents=True, exist_ok=True)
-    visual_indices = _select_visual_indices(
-        dataset.entries,
-        args.visual_examples_per_subject,
-    )
+    if visual_subjects:
+        for role in set(visual_roles.values()):
+            (visualization_dir / role).mkdir(parents=True, exist_ok=True)
 
     window_rows: list[dict[str, Any]] = []
     visualized_per_subject: dict[str, int] = defaultdict(int)
     with torch.inference_mode():
-        for index, batch in enumerate(loader):
+        for batch_index, batch in enumerate(loader):
+            index = selected_indices[batch_index]
             entry = dataset.entries[index]
             subject = str(entry["subject"])
             sample = batch[0].to(device, non_blocking=device.type == "cuda")
             draw_rows = []
             saved_visualization = False
-            for draw in range(args.mask_repeats):
+            draw_count = args.mask_repeats if subject in evaluation_subjects else 1
+            for draw in range(draw_count):
                 _seed_mask_draw(args.seed + index * args.mask_repeats + draw, device)
                 prediction, clean, noise, token_mask = model(
                     sample.unsqueeze(0),
@@ -352,7 +393,8 @@ def main() -> None:
                     (time, x_size, y_size, z_size),
                     patch_size,
                 )
-                draw_rows.append(_evaluate_draw(prediction, clean, noise, sample, voxel_mask))
+                if subject in evaluation_subjects:
+                    draw_rows.append(_evaluate_draw(prediction, clean, noise, sample, voxel_mask))
 
                 if (
                     draw == 0
@@ -363,7 +405,7 @@ def main() -> None:
                         f"{int(entry['start']):06d}-{int(entry['stop']):06d}.png"
                     )
                     _save_visualization(
-                        visualization_dir / filename,
+                        visualization_dir / visual_roles[subject] / filename,
                         sample,
                         prediction,
                         clean,
@@ -372,6 +414,14 @@ def main() -> None:
                     )
                     visualized_per_subject[subject] += 1
                     saved_visualization = True
+
+            if subject not in evaluation_subjects:
+                print(
+                    f"Visualized {visual_roles[subject]} subject {subject} "
+                    f"({batch_index + 1}/{len(selected_indices)})"
+                    + ("; saved visualization" if saved_visualization else "")
+                )
+                continue
 
             row: dict[str, Any] = {
                 "subject": subject,
@@ -384,7 +434,8 @@ def main() -> None:
             window_rows.append(row)
             print(
                 f"Evaluated {row['subject']} {row['run']} "
-                f"frames {row['start']}:{row['stop']} ({index + 1}/{len(dataset)})"
+                f"frames {row['start']}:{row['stop']} "
+                f"({batch_index + 1}/{len(selected_indices)})"
                 + ("; saved visualization" if saved_visualization else "")
             )
 
@@ -410,7 +461,11 @@ def main() -> None:
     summary_json = {
         "checkpoint": str(checkpoint_path),
         "data_dir": str(Path(args.data_dir).expanduser().resolve()),
-        "subjects": sorted(loaded_subjects),
+        "subjects": sorted(evaluation_subjects),
+        "visualization_subjects_by_split": {
+            role: sorted(subject for subject, subject_role in visual_roles.items() if subject_role == role)
+            for role in ("train", "validation", "test")
+        },
         "time_frames": args.time_frames,
         "crop_size": args.crop_size,
         "patch_size": patch_size,

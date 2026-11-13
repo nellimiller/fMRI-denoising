@@ -36,6 +36,16 @@ if [[ ${#EVAL_SUBJECTS_ARRAY[@]} -eq 0 ]]; then
     exit 1
 fi
 
+VISUAL_SPLIT_ARGS=()
+if [[ -n "${EVAL_TRAIN_VISUAL_SUBJECTS:-}" ]]; then
+    read -r -a EVAL_TRAIN_VISUAL_ARRAY <<< "$EVAL_TRAIN_VISUAL_SUBJECTS"
+    VISUAL_SPLIT_ARGS+=(--train_visual_subjects "${EVAL_TRAIN_VISUAL_ARRAY[@]}")
+fi
+if [[ -n "${EVAL_VALIDATION_VISUAL_SUBJECTS:-}" ]]; then
+    read -r -a EVAL_VALIDATION_VISUAL_ARRAY <<< "$EVAL_VALIDATION_VISUAL_SUBJECTS"
+    VISUAL_SPLIT_ARGS+=(--validation_visual_subjects "${EVAL_VALIDATION_VISUAL_ARRAY[@]}")
+fi
+
 mkdir -p "$EVAL_DIR"
 
 uv run --no-sync python -c '
@@ -69,4 +79,5 @@ uv run --no-sync python -m src.evaluate_nsd \
     --mask_repeats "${EVAL_MASK_REPEATS:-1}" \
     --seed "${EVAL_SEED:-1234}" \
     --visual_examples_per_subject "${EVAL_VISUAL_EXAMPLES_PER_SUBJECT:-3}" \
+    "${VISUAL_SPLIT_ARGS[@]}" \
     "${EVAL_CROP_ARGS[@]}"

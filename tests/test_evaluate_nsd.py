@@ -46,8 +46,14 @@ def test_visual_examples_are_spread_across_each_subject() -> None:
     ] + [{"subject": "subj07", "run": "run1", "start": 0}]
 
     indices = _select_visual_indices(entries, examples_per_subject=3)
+    selected_subject_indices = _select_visual_indices(
+        entries,
+        examples_per_subject=3,
+        subjects={"subj08"},
+    )
 
     assert indices == {0, 4, 9, 10}
+    assert selected_subject_indices == {0, 4, 9}
 
 
 def test_visualization_saves_bold_heads_and_masks_panel(tmp_path) -> None:

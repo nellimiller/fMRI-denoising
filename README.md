@@ -231,6 +231,8 @@ export NSD_PROCESSED=/path/to/nsd_processed_40f_s20
 export CHECKPOINT=/path/to/run/checkpoints/best-validation-checkpoint.ckpt
 export EVAL_DIR=/path/to/persistent/evaluations/nsd_test
 export EVAL_SUBJECTS=subj08
+export EVAL_TRAIN_VISUAL_SUBJECTS=subj01
+export EVAL_VALIDATION_VISUAL_SUBJECTS=subj07
 
 sbatch scripts/cluster/nsd_evaluate.slurm
 ```
@@ -238,13 +240,18 @@ sbatch scripts/cluster/nsd_evaluate.slurm
 The evaluator loads model hyperparameters from the Lightning checkpoint and
 writes `metrics_by_window.csv`, `metrics_by_run.csv`,
 `metrics_by_subject.csv`, and `summary.json` to `EVAL_DIR`. It also saves up
-to three example slice panels per subject under `EVAL_DIR/visualizations/`.
-Each panel shows observed BOLD, the predicted clean head, reconstruction,
-noise head, reconstruction residual, and GM/WM/CSF masks. Input, clean, and
-reconstruction panels use the same intensity scale. The predicted clean head
-is an experimental output, not a validated clean-signal estimate. Examples
-are selected across each subject's windows and show the middle time point on
-the axial slice with the most tissue-mask voxels.
+to three example slice panels per subject under
+`EVAL_DIR/visualizations/{train,validation,test}/`. `EVAL_SUBJECTS` are the
+test subjects included in the quantitative metrics. Optional
+`EVAL_TRAIN_VISUAL_SUBJECTS` and `EVAL_VALIDATION_VISUAL_SUBJECTS` add
+training/validation subjects for visual comparison only; they are excluded
+from the metric CSVs. Each panel shows observed BOLD, the predicted clean
+head, reconstruction, noise head, reconstruction residual, and GM/WM/CSF
+masks. Input, clean, and reconstruction panels use the same intensity scale.
+The predicted clean head is an experimental output, not a validated
+clean-signal estimate. Examples are selected across each subject's windows
+and show the middle time point on the axial slice with the most tissue-mask
+voxels.
 
 Metrics include full and masked MSE/MAE/RMSE and correlation, tissue-specific
 MSE, and clean and noise output energy. The run and subject summaries average
