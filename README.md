@@ -21,6 +21,62 @@ alone do not uniquely identify the clean and noise components. Treat the
 separation as an experimental hypothesis, not validated denoising; inspect
 the component metrics and visualizations before drawing conclusions.
 
+## Region-guided projection baseline
+
+`src/utils/region_guided.py` provides a separate, deterministic baseline for
+the WM/CSF-guided assumption. It estimates one nuisance time course from the
+observed BOLD mean in each of the WM and CSF masks, then subtracts the
+least-squares projection of those two time courses from each GM voxel. It does
+not use PCA, change the existing SwinMAE, or claim that all WM/CSF variation is
+noise.
+
+```python
+from utils.region_guided import region_guided_projection
+
+# batch has shape [B, 4, T, X, Y, Z]: BOLD, GM, WM, CSF
+result = region_guided_projection(
+    batch[:, 0],
+    batch[:, 1],
+    batch[:, 2],
+    batch[:, 3],
+)
+clean_bold = result.clean
+removed_component = result.noise
+```
+
+The masks may be static `[X, Y, Z]` / `[B, X, Y, Z]` or repeated
+`[B, T, X, Y, Z]`; repeated masks must be identical across time. The returned
+`clean` keeps the input unchanged outside GM. `noise` is the projected
+component removed from GM and is zero elsewhere. Their sum is the original
+input by construction, so `reconstruction` is an accounting check—not a
+denoised result. Use `clean` as the candidate denoised signal.
+
+The method deliberately makes the intended subtraction explicit instead of
+asking two unconstrained network heads to discover it indirectly. It uses the
+observed WM/CSF time courses, not a learned noise head, and the per-voxel
+projection makes the clean GM residual orthogonal to the two nuisance traces.
+It can still remove genuine GM signal that covaries with those traces; this
+assumption must be checked against task-related responses. Estimate traces
+over full runs where possible: fitting them independently in short,
+overlapping windows can make the removed signal change at window boundaries.
+
+### What the first evaluation showed
+
+The supplied evaluation tested `subj08` across 12 runs and 168 forty-frame
+windows, using one mask draw per window. The reported sum reconstruction had
+MSE `0.8198`, MAE `0.4689`, RMSE `0.9054`, and Pearson correlation `0.5925`.
+Masked MSE was almost identical (`0.8197`). Run-level MSE ranged from `0.8103`
+to `0.8237`, but those windows overlap and all belong to one subject. Tissue
+MSE was `0.8074` in GM, `0.3162` in WM, and `3.3845` in CSF. The clean/noise
+head energies were `0.6073` and `0.2848`. These values show that the trained
+model reconstructs some of the observed, per-window-normalized BOLD, with
+notably larger CSF error. They do **not** show that the clean head removes
+nuisance signal: there is no clean-fMRI target, and the evaluation scores the
+sum against the observed signal.
+The three example plots show only one middle frame and one tissue-rich slice
+per selected window; they cannot establish temporal denoising or preservation
+of stimulus-related activity.
+
 ## Environment
 
 The project requires Python 3.13 or newer and uses `uv`:
@@ -104,6 +160,11 @@ Useful options include:
 | `--validation_subjects` | Explicit subject IDs to reserve for validation. |
 | `--crop_size X Y Z` | Crop the volume around the tissue-mask center. |
 | `--patch_size` / `--embed_dim` | Model capacity; defaults are `14` / `96`. |
+| `--mask_ratio` | Fraction of spatial tube tokens masked; default `0.75`. |
+| `--weight_decay` | AdamW weight decay; default `0.05`. |
+| `--masked_loss_weight` / `--full_loss_weight` | Masked and full reconstruction weights; both default `1.0`. |
+| `--flat_loss_weight` / `--ortho_loss_weight` / `--fft_loss_weight` | Tissue and spectrum loss weights; defaults `1.0`, `0.001`, `0.1`. |
+| `--early_stopping_patience` | Stop after this many non-improving validation epochs; `0` disables it. |
 | `--precision` | Lightning precision mode; use `32-true` for a conservative smoke run. |
 | `--gradient_clip_val` | Clip gradient norm (default `1.0`). |
 | `--log_dir` | Persist CSV metrics (default `logs_nsd/`). |
@@ -169,9 +230,17 @@ flatness, orthogonality, and FFT components. It also logs clean/noise output
 energy and the masked-token fraction. Checkpoints are written to
 `checkpoints_nsd/` by default. A validation slice panel for a fixed sample is
 saved to `validation_visualizations/` after each validation epoch; the
-randomized mask means the reconstruction may vary between epochs.
+training mask is randomized, while validation uses a fixed mask per batch so
+validation curves are comparable across epochs.
 The FFT component is calculated in float32 so mixed-precision training supports
 the default 40-frame sequence length on CUDA.
+
+The trainer always keeps the best `val_total` checkpoint. Optional early
+stopping monitors the same value; it does not change which checkpoint is
+selected. A rising validation curve after a falling training curve is
+consistent with overfitting, but can also reflect an unstable objective or
+data preprocessing. Compare the individual logged loss terms and the temporal
+evaluation before changing several hyperparameters at once.
 
 ## Adding evaluation metrics
 
@@ -218,6 +287,38 @@ and CSF. These are reconstruction/consistency diagnostics, not evidence that
 the clean head is biologically clean: only the sum of the two heads is directly
 constrained by reconstruction, so their decomposition is not identifiable
 from the current objective alone.
+
+### Temporal evaluation of a candidate clean signal
+
+Run `src.evaluate_temporal` after training to compare the learned clean head
+with the direct WM/CSF regional-mean projection on held-out windows:
+
+```bash
+export NSD_PROCESSED=/path/to/nsd_processed_40f_s20
+export CHECKPOINT=/path/to/run/checkpoints/best-validation-checkpoint.ckpt
+export EVAL_DIR=/path/to/persistent/evaluations/nsd_test
+export EVAL_SUBJECTS=subj08
+export TEMPORAL_MAX_WINDOWS_PER_SUBJECT=12
+
+sbatch scripts/cluster/nsd_temporal_evaluate.slurm
+```
+
+The job writes `temporal_metrics_by_window.csv`, `temporal_summary.json`, and
+representative plots under `$EVAL_DIR/temporal/`. Metrics include GM temporal
+standard-deviation and first-difference ratios, per-voxel correlation with
+input, high-frequency power fraction, and absolute correlation with the
+observed WM/CSF mean traces before and after cleaning. The plots compare a
+representative GM voxel and the mean GM power spectrum across the window.
+Frequency is reported in cycles/frame because the evaluator does not assume a
+TR.
+
+These are diagnostics, not ground-truth denoising scores. In particular,
+WM/CSF correlations use traces from the same window and are therefore
+descriptive rather than independent validation; the direct projection is
+orthogonal to those traces by construction. A lower correlation, temporal
+variance, or high-frequency fraction can mean signal removal as well as noise
+removal. Check stimulus-related response preservation separately, for example
+with aligned held-out GLM responses or repeat reliability.
 
 ### Run held-out evaluation on Slurm
 
@@ -423,15 +524,14 @@ Without clean ground-truth fMRI, validation loss measures reconstruction and
 consistency, not denoising accuracy; see the evaluation notes above before
 interpreting it scientifically.
 
-### Full training after the pilot
+### Full-window quality pilot and full training
 
-The one-epoch pilot checked execution, but its short windows and small model
-are not a full training run. The separate `scripts/cluster/nsd_train.slurm`
-uses the regular model defaults (`patch_size=14`, `embed_dim=96`), 40-frame
-windows, batch size 1, and 100 epochs. It defaults to subjects 1-6 for
-training and subject 7 for validation; subject 8 is not loaded, leaving it
-available for a later final test. Change the split only before starting the
-run, and choose a held-out test subject distinct from the validation subjects.
+The one-epoch `nsd_pilot.slurm` checks execution only: it uses short windows,
+a small crop, and a smaller model. For a useful fast evaluation, first use
+`nsd_train.slurm` for five epochs with the **same 40-frame data, full model,
+and subject split** intended for the full run. The regular job defaults to
+subjects 1-6 for training and subject 7 for validation; subject 8 remains
+held out. Use separate run directories for pilot and final outputs.
 
 Preprocess a fresh full-window directory using a Slurm CPU job. The stride of
 20 creates overlapping windows; this can produce many more samples than the
@@ -451,35 +551,75 @@ FULL_PREP_JOB_ID="${FULL_PREP_JOB_ID%%;*}"
 echo "Full-window preprocessing job: $FULL_PREP_JOB_ID"
 ```
 
-Once submitted, preprocessing runs on the compute node. The following
-dependent training job will not start unless preprocessing succeeds. Ensure
-W&B credentials are available to the job through the cluster-approved method:
+Once submitted, preprocessing runs on the compute node. After it succeeds,
+submit the five-epoch quality pilot. This checks early loss behavior and gives
+a checkpoint for the temporal diagnostics; it is not sufficient to establish
+convergence or denoising quality. Ensure W&B credentials are available to the
+job through the cluster-approved method:
 
 ```bash
-FULL_TRAIN_JOB_ID=$(sbatch --parsable \
+QUALITY_RUN_DIR="$FULL_RUN_DIR/quality-pilot-5ep"
+QUALITY_PILOT_JOB_ID=$(sbatch --parsable \
   --dependency="afterok:$FULL_PREP_JOB_ID" \
-  --output="$FULL_RUN_DIR/logs/slurm/train-%j.out" \
-  --error="$FULL_RUN_DIR/logs/slurm/train-%j.err" \
-  --export=ALL,NSD_PROCESSED="$FULL_PROCESSED",RUN_DIR="$FULL_RUN_DIR",TRAIN_SUBJECTS="subj01 subj02 subj03 subj04 subj05 subj06",VALIDATION_SUBJECTS=subj07,TRAIN_TIME_FRAMES=40,TRAIN_EPOCHS=100 \
+  --output="$FULL_RUN_DIR/logs/slurm/quality-pilot-%j.out" \
+  --error="$FULL_RUN_DIR/logs/slurm/quality-pilot-%j.err" \
+  --export=ALL,NSD_PROCESSED="$FULL_PROCESSED",RUN_DIR="$QUALITY_RUN_DIR",TRAIN_SUBJECTS="subj01 subj02 subj03 subj04 subj05 subj06",VALIDATION_SUBJECTS=subj07,TRAIN_TIME_FRAMES=40,TRAIN_EPOCHS=5,TRAIN_EARLY_STOPPING_PATIENCE=0 \
+  scripts/cluster/nsd_train.slurm)
+QUALITY_PILOT_JOB_ID="${QUALITY_PILOT_JOB_ID%%;*}"
+echo "Quality-pilot job: $QUALITY_PILOT_JOB_ID"
+```
+
+After the pilot completes, select its **best-validation** checkpoint (not
+`last.ckpt`) and run the temporal comparison on held-out `subj08`:
+
+```bash
+export CHECKPOINT="$QUALITY_RUN_DIR/checkpoints/<best-validation-checkpoint>.ckpt"
+export EVAL_DIR="$FULL_RUN_DIR/evaluation"
+export EVAL_SUBJECTS=subj08
+export TEMPORAL_MAX_WINDOWS_PER_SUBJECT=12
+TEMPORAL_EVAL_JOB_ID=$(sbatch --parsable scripts/cluster/nsd_temporal_evaluate.slurm)
+TEMPORAL_EVAL_JOB_ID="${TEMPORAL_EVAL_JOB_ID%%;*}"
+echo "Temporal evaluation job: $TEMPORAL_EVAL_JOB_ID"
+```
+
+Inspect the CSV, plots, and validation curves before launching the full run.
+In particular, compare temporal attenuation in GM against the WM/CSF
+projection baseline and check that the model has not simply collapsed the GM
+time courses. These checks are descriptive, not proof of neural-signal
+preservation. If the pilot reveals a preprocessing or objective problem,
+change that first and repeat the short run.
+
+For the full run, start a fresh training run from scratch with the intended
+total epoch budget and optional early stopping. The model uses a cosine
+schedule based on `TRAIN_EPOCHS`; the five-epoch pilot checkpoint should not
+be resumed as though it had the full-run schedule. Resume support is not
+currently configured in this script.
+
+```bash
+FULL_TRAIN_DIR="$FULL_RUN_DIR/full-60ep"
+FULL_TRAIN_JOB_ID=$(sbatch --parsable \
+  --output="$FULL_RUN_DIR/logs/slurm/full-train-%j.out" \
+  --error="$FULL_RUN_DIR/logs/slurm/full-train-%j.err" \
+  --export=ALL,NSD_PROCESSED="$FULL_PROCESSED",RUN_DIR="$FULL_TRAIN_DIR",TRAIN_SUBJECTS="subj01 subj02 subj03 subj04 subj05 subj06",VALIDATION_SUBJECTS=subj07,TRAIN_TIME_FRAMES=40,TRAIN_EPOCHS=60,TRAIN_EARLY_STOPPING_PATIENCE=8 \
   scripts/cluster/nsd_train.slurm)
 FULL_TRAIN_JOB_ID="${FULL_TRAIN_JOB_ID%%;*}"
 echo "Full training job: $FULL_TRAIN_JOB_ID"
 ```
 
-The 100-epoch default is a starting configuration, not a runtime estimate.
-Ask for a wall-time limit supported by the cluster and watch epoch duration.
-The learning-rate cosine schedule uses the configured epoch count, so set
-`TRAIN_EPOCHS` to the intended total before starting. If the job reaches its
-time limit, it currently does not automatically resume from a checkpoint;
-do not assume that a checkpoint is a resumable run without explicitly
-continuing with the intended checkpoint path.
+With the earlier rise in `val_total` around epoch 25, a 60-epoch cap and
+patience of 8 are a reasonable next trial: the best checkpoint is still
+selected by `val_total`, and training stops after eight validation epochs
+without improvement. Keep the current learning rate and loss weights for this
+comparison; change one scientific or optimization variable at a time. If the
+same trend persists with fixed validation masks, it is stronger evidence of
+overfitting. Check train and validation loss components, not only the total.
 
-Monitor both jobs with:
+Monitor preprocessing, pilot, evaluation, and full-training jobs with:
 
 ```bash
-squeue -j "$FULL_PREP_JOB_ID,$FULL_TRAIN_JOB_ID" -o "%.18i %.24j %.8T %.10M %R"
-sacct -j "$FULL_PREP_JOB_ID,$FULL_TRAIN_JOB_ID" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS
-tail -f "$FULL_RUN_DIR/logs/slurm/train-${FULL_TRAIN_JOB_ID}.out"
+squeue -j "$FULL_PREP_JOB_ID,$QUALITY_PILOT_JOB_ID,$TEMPORAL_EVAL_JOB_ID,$FULL_TRAIN_JOB_ID" -o "%.18i %.24j %.8T %.10M %R"
+sacct -j "$FULL_PREP_JOB_ID,$QUALITY_PILOT_JOB_ID,$TEMPORAL_EVAL_JOB_ID,$FULL_TRAIN_JOB_ID" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS
+tail -f "$FULL_RUN_DIR/logs/slurm/full-train-${FULL_TRAIN_JOB_ID}.out"
 ```
 
 Training checkpoints are under `$FULL_RUN_DIR/checkpoints`, local CSV metrics
@@ -513,6 +653,7 @@ src/
 │   └── synthetic.py                # Synthetic data for smoke tests
 ├── data_preprocessing/nsd/
 │   └── preprocess.py               # NSD masks and temporal manifests
+├── evaluate_temporal.py            # Temporal comparison of model and projection outputs
 ├── models/
 │   ├── mae_core.py                 # Masked hierarchical Swin encoder
 │   ├── decoder.py                  # Additive clean/noise output heads
@@ -520,8 +661,13 @@ src/
 ├── utils/
 │   ├── losses.py                   # Reconstruction and structural losses
 │   ├── masking.py                  # Token masking
+│   ├── region_guided.py            # Explicit WM/CSF nuisance projection baseline
+│   ├── temporal_metrics.py         # Temporal signal diagnostics
 │   ├── visualization.py            # Validation slice panels
 │   └── train_nsd_overfit.py        # Single-window diagnostic
 ├── train_nsd.py                    # Canonical NSD training entry point
 └── test_pipeline.py                # Manual synthetic forward/backward check
 ```
+
+The matching Slurm entry point for temporal diagnostics is
+`scripts/cluster/nsd_temporal_evaluate.slurm`.

@@ -39,6 +39,7 @@ class fMRIDenoisingLightning(L.LightningModule):
         flat_loss_weight: float = 1.0,
         ortho_loss_weight: float = 1e-3,
         fft_loss_weight: float = 0.1,
+        validation_seed: int = 1234,
     ) -> None:
         """Initialize hyperparameters, core model, and loss function."""
         super().__init__()
@@ -123,7 +124,25 @@ class fMRIDenoisingLightning(L.LightningModule):
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
         """Process a single validation batch."""
-        return self._shared_step(batch, phase="val")
+        seed = (
+            int(self.hparams.validation_seed)
+            + int(self.global_rank) * 1_000_003
+            + batch_idx
+        )
+        devices = (
+            [
+                batch.device.index
+                if batch.device.index is not None
+                else torch.cuda.current_device()
+            ]
+            if batch.device.type == "cuda"
+            else []
+        )
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(seed)
+            if devices:
+                torch.cuda.manual_seed(seed)
+            return self._shared_step(batch, phase="val")
     
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure the AdamW optimizer and Cosine Annealing schedule."""

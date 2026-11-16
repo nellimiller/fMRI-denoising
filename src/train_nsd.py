@@ -10,11 +10,12 @@ If running directly from the src/ folder:
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader, Subset
 
@@ -166,6 +167,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embed_dim", type=int, default=96)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--precision", default="16-mixed")
+    parser.add_argument("--mask_ratio", type=float, default=0.75)
+    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--masked_loss_weight", type=float, default=1.0)
+    parser.add_argument("--full_loss_weight", type=float, default=1.0)
+    parser.add_argument("--flat_loss_weight", type=float, default=1.0)
+    parser.add_argument("--ortho_loss_weight", type=float, default=1e-3)
+    parser.add_argument("--fft_loss_weight", type=float, default=0.1)
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=0,
+        help="Stop after this many validation epochs without improvement; 0 disables it.",
+    )
 
     # Logging & Checkpointing params
     parser.add_argument("--use_wandb", action="store_true")
@@ -182,6 +196,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Execute the PyTorch Lightning training pipeline."""
     args = parse_args()
+    if not 0.0 <= args.mask_ratio < 1.0:
+        raise ValueError("--mask_ratio must be in [0, 1).")
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early_stopping_patience cannot be negative.")
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        raise ValueError("--lr must be finite and positive.")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        raise ValueError("--weight_decay must be finite and non-negative.")
+    loss_weights = (
+        args.masked_loss_weight,
+        args.full_loss_weight,
+        args.flat_loss_weight,
+        args.ortho_loss_weight,
+        args.fft_loss_weight,
+    )
+    if any(not math.isfinite(weight) or weight < 0 for weight in loss_weights):
+        raise ValueError("Loss weights must be finite and non-negative.")
+
     L.seed_everything(args.seed, workers=True)
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -205,8 +237,15 @@ def main() -> None:
         in_chans=4,
         patch_size=args.patch_size,
         embed_dim=args.embed_dim,
-        mask_ratio=0.75,
+        mask_ratio=args.mask_ratio,
         lr=args.lr,
+        weight_decay=args.weight_decay,
+        masked_loss_weight=args.masked_loss_weight,
+        full_loss_weight=args.full_loss_weight,
+        flat_loss_weight=args.flat_loss_weight,
+        ortho_loss_weight=args.ortho_loss_weight,
+        fft_loss_weight=args.fft_loss_weight,
+        validation_seed=args.seed,
     )
 
     log_dir = Path(args.log_dir)
@@ -228,11 +267,22 @@ def main() -> None:
         output_dir=args.visualization_dir,
         every_n_epochs=args.visualize_every_n_epochs,
     )
+    callbacks = [checkpoint_callback, visualization_callback]
+    if args.early_stopping_patience:
+        callbacks.append(
+            EarlyStopping(
+                monitor="val_total",
+                mode="min",
+                patience=args.early_stopping_patience,
+                check_finite=True,
+                verbose=True,
+            )
+        )
 
     trainer = L.Trainer(
         max_epochs=args.epochs,
         logger=loggers,
-        callbacks=[checkpoint_callback, visualization_callback],
+        callbacks=callbacks,
         accelerator="auto",
         devices="auto",
         # 16-mixed precision halves VRAM usage while maintaining gradient stability

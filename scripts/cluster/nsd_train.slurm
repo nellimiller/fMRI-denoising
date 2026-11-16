@@ -90,6 +90,11 @@ if [[ -n "${TRAIN_CROP_SIZE:-}" ]]; then
     CROP_ARGS=(--crop_size "$TRAIN_CROP_SIZE" "$TRAIN_CROP_SIZE" "$TRAIN_CROP_SIZE")
 fi
 
+EARLY_STOPPING_ARGS=()
+if [[ -n "${TRAIN_EARLY_STOPPING_PATIENCE:-}" ]]; then
+    EARLY_STOPPING_ARGS=(--early_stopping_patience "$TRAIN_EARLY_STOPPING_PATIENCE")
+fi
+
 RUN_NAME="${TRAIN_WANDB_NAME:-nsd-full-40frame-${SLURM_JOB_ID:-run}}"
 
 echo "Training subjects: ${TRAIN_SUBJECTS[*]}"
@@ -105,11 +110,20 @@ uv run --no-sync python -m src.train_nsd \
     --epochs "${TRAIN_EPOCHS:-100}" \
     --lr "${TRAIN_LR:-1.5e-4}" \
     --num_workers "${TRAIN_NUM_WORKERS:-4}" \
+    --gradient_clip_val "${TRAIN_GRADIENT_CLIP_VAL:-1.0}" \
     --seed "${TRAIN_SEED:-1234}" \
     --precision "${TRAIN_PRECISION:-16-mixed}" \
     --patch_size "${TRAIN_PATCH_SIZE:-14}" \
     --embed_dim "${TRAIN_EMBED_DIM:-96}" \
+    --mask_ratio "${TRAIN_MASK_RATIO:-0.75}" \
+    --weight_decay "${TRAIN_WEIGHT_DECAY:-0.05}" \
+    --masked_loss_weight "${TRAIN_MASKED_LOSS_WEIGHT:-1.0}" \
+    --full_loss_weight "${TRAIN_FULL_LOSS_WEIGHT:-1.0}" \
+    --flat_loss_weight "${TRAIN_FLAT_LOSS_WEIGHT:-1.0}" \
+    --ortho_loss_weight "${TRAIN_ORTHO_LOSS_WEIGHT:-0.001}" \
+    --fft_loss_weight "${TRAIN_FFT_LOSS_WEIGHT:-0.1}" \
     "${CROP_ARGS[@]}" \
+    "${EARLY_STOPPING_ARGS[@]}" \
     --checkpoint_dir "$RUN_DIR/checkpoints" \
     --log_dir "$RUN_DIR/logs" \
     --visualization_dir "$RUN_DIR/visualizations" \
