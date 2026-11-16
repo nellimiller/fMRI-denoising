@@ -284,8 +284,13 @@ def main() -> None:
             )
             with torch.random.fork_rng(devices=devices):
                 _seed_mask(seed, device)
-                _, clean, _, _ = model(sample.unsqueeze(0), tube_masking=True)
-            model_clean = clean[0, 0, :time, :x_size, :y_size, :z_size]
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.float16,
+                    enabled=device.type == "cuda",
+                ):
+                    _, clean, _, _ = model(sample.unsqueeze(0), tube_masking=True)
+            model_clean = clean[0, 0, :time, :x_size, :y_size, :z_size].float()
 
             projection = region_guided_projection(
                 sample[0].unsqueeze(0),

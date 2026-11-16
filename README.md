@@ -310,7 +310,8 @@ input, high-frequency power fraction, and absolute correlation with the
 observed WM/CSF mean traces before and after cleaning. The plots compare a
 representative GM voxel and the mean GM power spectrum across the window.
 Frequency is reported in cycles/frame because the evaluator does not assume a
-TR.
+TR. CUDA inference uses FP16 autocast to reduce memory use on GPU/MIG
+allocations; diagnostic metrics are calculated in FP32.
 
 These are diagnostics, not ground-truth denoising scores. In particular,
 WM/CSF correlations use traces from the same window and are therefore
