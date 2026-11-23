@@ -12,82 +12,46 @@ set -euo pipefail
 
 REPO_DIR="${SLURM_SUBMIT_DIR:?Submit this job from the repository root}"
 cd "$REPO_DIR"
+source "$REPO_DIR/scripts/cluster/pipeline.env"
 export PATH="$HOME/.local/bin:$PATH"
 
-: "${NSD_PROCESSED:?Set NSD_PROCESSED to the processed NSD directory}"
-: "${CHECKPOINT:?Set CHECKPOINT to the trained best Lightning checkpoint}"
-: "${EVAL_DIR:?Set EVAL_DIR to persistent evaluation output storage}"
+mkdir -p "$RUN_DIR" "$CKPT_DIR" "$EVAL_DIR" "$SLURM_LOG_DIR"
+cp "$REPO_DIR/scripts/cluster/pipeline.env" "$RUN_DIR/pipeline.env"
 
-if [[ ! -d "$NSD_PROCESSED" ]]; then
-    echo "Processed NSD directory does not exist: $NSD_PROCESSED" >&2
-    exit 1
-fi
-if [[ ! -f "$CHECKPOINT" ]]; then
-    echo "Checkpoint does not exist: $CHECKPOINT" >&2
+if [[ ! -d "$NSD_PROC_DIR" || ! -f "$CHECKPOINT" ]]; then
+    echo "Processed data or checkpoint is missing: $NSD_PROC_DIR / $CHECKPOINT" >&2
     exit 1
 fi
 if ! command -v uv >/dev/null 2>&1; then
-    echo "uv was not found. Load the cluster's uv module or add its install directory to PATH." >&2
+    echo "uv was not found. Load the cluster's uv module or add it to PATH." >&2
     exit 1
 fi
 
-read -r -a EVAL_SUBJECTS_ARRAY <<< "${EVAL_SUBJECTS:-subj08}"
-if [[ ${#EVAL_SUBJECTS_ARRAY[@]} -eq 0 ]]; then
-    echo "EVAL_SUBJECTS must contain at least one subject ID." >&2
-    exit 1
+read -r -a TEST_SUBJECTS_ARRAY <<< "$TEST_SUBJECTS"
+read -r -a VALIDATION_SUBJECTS_ARRAY <<< "$VAL_SUBJECTS"
+read -r -a TRAIN_SUBJECTS_ARRAY <<< "$TRAIN_SUBJECTS"
+CROP_ARGS=()
+if [[ -n "$CROP_SIZE" ]]; then
+    read -r -a CROP_VALUES <<< "$CROP_SIZE"
+    CROP_ARGS=(--crop_size "${CROP_VALUES[@]}")
 fi
-
-read -r -a EVAL_VALIDATION_ARRAY <<< "${EVAL_VALIDATION_SUBJECTS:-subj07}"
-VISUAL_SPLIT_ARGS=()
-if [[ -n "${EVAL_TRAIN_VISUAL_SUBJECTS:-}" ]]; then
-    read -r -a EVAL_TRAIN_VISUAL_ARRAY <<< "$EVAL_TRAIN_VISUAL_SUBJECTS"
-    VISUAL_SPLIT_ARGS+=(--train_visual_subjects "${EVAL_TRAIN_VISUAL_ARRAY[@]}")
-fi
-if [[ ${#EVAL_VALIDATION_ARRAY[@]} -gt 0 && -n "${EVAL_VALIDATION_ARRAY[0]}" ]]; then
-    VISUAL_SPLIT_ARGS+=(--validation_subjects "${EVAL_VALIDATION_ARRAY[@]}")
-fi
-TR_ARGS=()
-if [[ -n "${EVAL_TR:-}" ]]; then
-    TR_ARGS=(--tr "$EVAL_TR")
-fi
-
-mkdir -p "$EVAL_DIR"
-
-uv run --no-sync python -c '
-import torch
-print(f"PyTorch: {torch.__version__}; CUDA runtime: {torch.version.cuda}")
-if not torch.cuda.is_available():
-    raise SystemExit("CUDA is unavailable in this Slurm job.")
-print(f"GPU: {torch.cuda.get_device_name(0)}")
-'
-
-EVAL_CROP_ARGS=()
-if [[ -n "${EVAL_CROP_SIZE:-}" ]]; then
-    read -r -a EVAL_CROP_ARRAY <<< "$EVAL_CROP_SIZE"
-    if [[ ${#EVAL_CROP_ARRAY[@]} -ne 3 ]]; then
-        echo "EVAL_CROP_SIZE must contain exactly three integers: X Y Z." >&2
-        exit 1
-    fi
-    EVAL_CROP_ARGS=(--crop_size "${EVAL_CROP_ARRAY[@]}")
-fi
-
-echo "Evaluating checkpoint: $CHECKPOINT"
-echo "Test subjects: ${EVAL_SUBJECTS_ARRAY[*]}; validation subjects: ${EVAL_VALIDATION_ARRAY[*]:-none}"
 
 uv run --no-sync python -m src.evaluate_nsd \
-    --data_dir "$NSD_PROCESSED" \
+    --data_dir "$NSD_PROC_DIR" \
     --checkpoint "$CHECKPOINT" \
-    --subjects "${EVAL_SUBJECTS_ARRAY[@]}" \
+    --subjects "${TEST_SUBJECTS_ARRAY[@]}" \
+    --validation_subjects "${VALIDATION_SUBJECTS_ARRAY[@]}" \
+    --train_visual_subjects "${TRAIN_SUBJECTS_ARRAY[@]:0:1}" \
     --output_dir "$EVAL_DIR" \
-    --time_frames "${EVAL_TIME_FRAMES:-40}" \
-    --num_workers "${EVAL_NUM_WORKERS:-4}" \
-    --K "${EVAL_K:-4}" \
-    --inference_mode "${EVAL_INFERENCE_MODE:-kpass}" \
-    --mask_repeats "${EVAL_MASK_REPEATS:-1}" \
-    --max_windows_per_subject "${EVAL_MAX_WINDOWS_PER_SUBJECT:-0}" \
-    --detrend "${EVAL_DETREND:-run}" \
-    "${TR_ARGS[@]}" \
-    --seed "${EVAL_SEED:-1234}" \
-    --visual_examples_per_subject "${EVAL_VISUAL_EXAMPLES_PER_SUBJECT:-3}" \
-    "${VISUAL_SPLIT_ARGS[@]}" \
-    "${EVAL_CROP_ARGS[@]}"
+    --time_frames "$TIME_FRAMES" \
+    --num_workers "$NUM_WORKERS" \
+    --K "$EVAL_K" \
+    --inference_mode "$EVAL_INFERENCE_MODE" \
+    --mask_repeats "$EVAL_MASK_REPEATS" \
+    --max_windows_per_subject "$EVAL_MAX_WINDOWS_PER_SUBJECT" \
+    --visual_examples_per_subject "$EVAL_VISUAL_EXAMPLES_PER_SUBJECT" \
+    --temporal_patch_size "$EVAL_TEMPORAL_PATCH_SIZE" \
+    --detrend "$DETREND" \
+    --tr "$PROC_TR" \
+    --seed "$SEED" \
+    "${CROP_ARGS[@]}"

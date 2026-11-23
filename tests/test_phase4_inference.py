@@ -158,7 +158,16 @@ def test_evaluate_temporal_compares_model_with_projection_baseline(nsd_world, mo
     summary = json.loads((out_dir / "temporal_summary.json").read_text())
     assert set(summary["methods"]) == {"model", "wm_csf_projection"}
     model_metrics = summary["methods"]["model"]
-    for name in ("gm_corr_clean_input_median", "gm_tsnr_input_median", "var_clean_frac", "band_power_frac_clean_median"):
+    for name in (
+        "gm_corr_clean_input_median",
+        "gm_tsnr_input_median",
+        "var_clean_frac",
+        "band_power_frac_clean_median",
+        "gm_patch_corr_clean_input_median",
+        "gm_patch_tsnr_before",
+        "gm_patch_tsnr_after",
+        "gm_patch_band_power_frac",
+    ):
         assert name in model_metrics
     assert list((out_dir / "temporal_plots").glob("*.png"))
 
@@ -179,7 +188,10 @@ def test_train_driver_writes_hparams_and_runs_final_evaluation(nsd_world) -> Non
     assert record["split"] == {
         "train_subjects": ["subj01"], "validation_subjects": ["subj02"], "test_subjects": ["subj03"],
     }
-    assert record["best_checkpoint"].endswith(".ckpt") and record["best_val_total"] is not None
+    assert record["best_checkpoint"].endswith("best.ckpt") and record["best_val_total"] is not None
+    assert (ckpt_dir / "best.ckpt").is_file()
+    assert (ckpt_dir / "last.ckpt").is_file()
+    assert (base / "run" / "epoch_metrics.csv").is_file()
     assert record["dataset"]["tr_seconds"] == [1.3]
     assert set(record["final_evaluation"]["splits"]) == {"validation", "test"}
     assert (ckpt_dir / "final_evaluation" / "summary.json").is_file()

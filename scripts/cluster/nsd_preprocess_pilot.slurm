@@ -12,53 +12,37 @@ set -euo pipefail
 
 REPO_DIR="${SLURM_SUBMIT_DIR:?Submit this job from the repository root}"
 cd "$REPO_DIR"
-
-: "${NSD_RAW:?Set NSD_RAW to the raw NSD root containing ppdata/ and timeseries/}"
-: "${NSD_PROCESSED:?Set NSD_PROCESSED to a fresh pilot output directory}"
-
+source "$REPO_DIR/scripts/cluster/pipeline.env"
 export PATH="$HOME/.local/bin:$PATH"
 
+mkdir -p "$RUN_DIR" "$CKPT_DIR" "$EVAL_DIR" "$SLURM_LOG_DIR" "$NSD_PROC_DIR"
+cp "$REPO_DIR/scripts/cluster/pipeline.env" "$RUN_DIR/pipeline.env"
+
 if ! command -v uv >/dev/null 2>&1; then
-    echo "uv was not found. Load the cluster's uv module or add its install directory to PATH." >&2
+    echo "uv was not found. Load the cluster's uv module or add it to PATH." >&2
+    exit 1
+fi
+if [[ ! -d "$NSD_RAW_DIR/ppdata" || ! -d "$NSD_RAW_DIR/timeseries" ]]; then
+    echo "NSD_RAW_DIR must contain ppdata/ and timeseries/: $NSD_RAW_DIR" >&2
     exit 1
 fi
 
-if [[ ! -d "$NSD_RAW/ppdata" || ! -d "$NSD_RAW/timeseries" ]]; then
-    echo "NSD_RAW must contain ppdata/ and timeseries/: $NSD_RAW" >&2
-    exit 1
-fi
-
-read -r -a SUBJECTS <<< "${PILOT_SUBJECTS:-subj01 subj02 subj03 subj04 subj05 subj06 subj07 subj08}"
-if [[ ${#SUBJECTS[@]} -eq 0 ]]; then
-    echo "PILOT_SUBJECTS must contain at least one subject ID." >&2
-    exit 1
-fi
-
-existing_manifest="$(find "$NSD_PROCESSED" -name manifest.json -print -quit 2>/dev/null || true)"
+read -r -a SUBJECTS <<< "$PROC_SUBJECTS"
+existing_manifest="$(find "$NSD_PROC_DIR" -name manifest.json -print -quit 2>/dev/null || true)"
 if [[ -n "$existing_manifest" ]]; then
-    echo "Found an existing manifest under $NSD_PROCESSED; use a fresh pilot directory." >&2
+    echo "Found an existing manifest under $NSD_PROC_DIR; use a fresh PROC_ID." >&2
     exit 1
 fi
 
-TR_ARGS=()
-if [[ -n "${PILOT_TR:-}" ]]; then
-    TR_ARGS=(--tr "$PILOT_TR")
-fi
-mkdir -p "$NSD_PROCESSED"
-
-echo "Preprocessing subjects: ${SUBJECTS[*]}"
-echo "Window length: ${PILOT_TIME_FRAMES:-8}; stride: ${PILOT_STRIDE:-10000}"
-
+echo "Preprocessing ${SUBJECTS[*]} at TR=${PROC_TR}s; window=${PROC_WINDOW}, stride=${PROC_STRIDE}"
 for subject in "${SUBJECTS[@]}"; do
-    echo "Preprocessing $subject"
     uv run --no-sync python -m src.data_preprocessing.nsd.preprocess \
-        --raw-root "$NSD_RAW" \
-        --output-root "$NSD_PROCESSED" \
+        --raw-root "$NSD_RAW_DIR" \
+        --output-root "$NSD_PROC_DIR" \
         --subject "$subject" \
-        --window-length "${PILOT_TIME_FRAMES:-8}" \
-        --stride "${PILOT_STRIDE:-10000}" \
-        "${TR_ARGS[@]}"
+        --window-length "$PROC_WINDOW" \
+        --stride "$PROC_STRIDE" \
+        --tr "$PROC_TR"
 done
 
-echo "Pilot preprocessing complete:"
-find "$NSD_PROCESSED" -mindepth 2 -maxdepth 2 -name manifest.json -print | sort
+find "$NSD_PROC_DIR" -mindepth 2 -maxdepth 2 -name manifest.json -print | sort

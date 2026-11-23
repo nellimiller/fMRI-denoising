@@ -11,56 +11,39 @@ set -euo pipefail
 
 REPO_DIR="${SLURM_SUBMIT_DIR:?Submit this job from the repository root}"
 cd "$REPO_DIR"
+source "$REPO_DIR/scripts/cluster/pipeline.env"
 export PATH="$HOME/.local/bin:$PATH"
 
-: "${NSD_PROCESSED:?Set NSD_PROCESSED to the processed NSD directory}"
-: "${CHECKPOINT:?Set CHECKPOINT to the trained Lightning checkpoint}"
-: "${EVAL_DIR:?Set EVAL_DIR to persistent evaluation output storage}"
+mkdir -p "$RUN_DIR" "$CKPT_DIR" "$EVAL_DIR" "$TEMPORAL_EVAL_DIR" "$SLURM_LOG_DIR"
+cp "$REPO_DIR/scripts/cluster/pipeline.env" "$RUN_DIR/pipeline.env"
 
-if [[ ! -d "$NSD_PROCESSED" ]]; then
-    echo "Processed NSD directory does not exist: $NSD_PROCESSED" >&2
-    exit 1
-fi
-if [[ ! -f "$CHECKPOINT" ]]; then
-    echo "Checkpoint does not exist: $CHECKPOINT" >&2
+if [[ ! -d "$NSD_PROC_DIR" || ! -f "$CHECKPOINT" ]]; then
+    echo "Processed data or checkpoint is missing: $NSD_PROC_DIR / $CHECKPOINT" >&2
     exit 1
 fi
 if ! command -v uv >/dev/null 2>&1; then
-    echo "uv was not found. Load the cluster's uv module or add its install directory to PATH." >&2
+    echo "uv was not found. Load the cluster's uv module or add it to PATH." >&2
     exit 1
 fi
 
-read -r -a SUBJECTS <<< "${EVAL_SUBJECTS:-subj08}"
-TEMPORAL_EVAL_DIR="${TEMPORAL_EVAL_DIR:-$EVAL_DIR/temporal}"
-mkdir -p "$TEMPORAL_EVAL_DIR"
-
-EVAL_CROP_ARGS=()
-if [[ -n "${EVAL_CROP_SIZE:-}" ]]; then
-    read -r -a EVAL_CROP_ARRAY <<< "$EVAL_CROP_SIZE"
-    if [[ ${#EVAL_CROP_ARRAY[@]} -ne 3 ]]; then
-        echo "EVAL_CROP_SIZE must contain exactly three integers: X Y Z." >&2
-        exit 1
-    fi
-    EVAL_CROP_ARGS=(--crop_size "${EVAL_CROP_ARRAY[@]}")
+read -r -a TEST_SUBJECTS_ARRAY <<< "$TEST_SUBJECTS"
+CROP_ARGS=()
+if [[ -n "$CROP_SIZE" ]]; then
+    read -r -a CROP_VALUES <<< "$CROP_SIZE"
+    CROP_ARGS=(--crop_size "${CROP_VALUES[@]}")
 fi
 
-uv run --no-sync python -c '
-import torch
-print(f"PyTorch: {torch.__version__}; CUDA runtime: {torch.version.cuda}")
-if not torch.cuda.is_available():
-    raise SystemExit("CUDA is unavailable in this Slurm job.")
-print(f"GPU: {torch.cuda.get_device_name(0)}")
-'
-
 uv run --no-sync python -m src.evaluate_temporal \
-    --data_dir "$NSD_PROCESSED" \
+    --data_dir "$NSD_PROC_DIR" \
     --checkpoint "$CHECKPOINT" \
-    --subjects "${SUBJECTS[@]}" \
+    --subjects "${TEST_SUBJECTS_ARRAY[@]}" \
     --output_dir "$TEMPORAL_EVAL_DIR" \
-    --time_frames "${EVAL_TIME_FRAMES:-40}" \
-    --max_windows_per_subject "${TEMPORAL_MAX_WINDOWS_PER_SUBJECT:-12}" \
-    --plots_per_subject "${TEMPORAL_PLOTS_PER_SUBJECT:-3}" \
-    --seed "${EVAL_SEED:-1234}" \
-    --K "${EVAL_K:-4}" \
-    --detrend "${EVAL_DETREND:-run}" \
-    "${EVAL_CROP_ARGS[@]}"
+    --time_frames "$TIME_FRAMES" \
+    --max_windows_per_subject "$TEMPORAL_MAX_WINDOWS_PER_SUBJECT" \
+    --plots_per_subject "$TEMPORAL_PLOTS_PER_SUBJECT" \
+    --temporal_patch_size "$EVAL_TEMPORAL_PATCH_SIZE" \
+    --seed "$SEED" \
+    --K "$EVAL_K" \
+    --detrend "$DETREND" \
+    --tr "$PROC_TR" \
+    "${CROP_ARGS[@]}"

@@ -35,12 +35,12 @@ try:
     from .data.channels import BRAIN, CSF, DYN, GM, STATIC, WM
     from .data.nsd_dataset import NSDDataset
     from .models.lightning_model import fMRIDenoisingLightning
-    from .utils.temporal_metrics import dynamic_metrics
+    from .utils.temporal_metrics import dynamic_metrics, gm_local_patch_trace
 except ImportError:
     from data.channels import BRAIN, CSF, DYN, GM, STATIC, WM
     from data.nsd_dataset import NSDDataset
     from models.lightning_model import fMRIDenoisingLightning
-    from utils.temporal_metrics import dynamic_metrics
+    from utils.temporal_metrics import dynamic_metrics, gm_local_patch_trace
 
 
 METRIC_NAMES = (
@@ -63,6 +63,14 @@ METRIC_NAMES = (
     "band_power_frac_clean_median",
     "band_power_frac_noise_median",
     "band_power_frac_resid_median",
+    "clean_active_voxel_frac",
+    "wm_csf_leakage_ratio",
+    "gm_spatial_grad_ratio",
+    "residual_lag1_acf",
+    "gm_patch_corr_clean_input_median",
+    "gm_patch_tsnr_before",
+    "gm_patch_tsnr_after",
+    "gm_patch_band_power_frac",
 )
 
 SPLIT_ORDER = ("train", "validation", "test")
@@ -91,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=1234, help="Base seed for the tube partitions")
     parser.add_argument("--max_windows_per_subject", type=int, default=0, help="Evenly spaced windows; 0 = all")
     parser.add_argument("--visual_examples_per_subject", type=int, default=3, help="0 disables figures")
+    parser.add_argument("--temporal_patch_size", type=int, default=3)
     parser.add_argument("--detrend", default="run", choices=["run", "window", "run+window", "none"])
     parser.add_argument("--tr", type=float, default=None, help="Repetition time override (seconds)")
     parser.add_argument("--amp", action="store_true", help="Run inference under fp16 autocast")
@@ -167,6 +176,7 @@ def _save_visualization(
     noise: torch.Tensor,
     entry: dict[str, Any],
     tr: float = 1.0,
+    temporal_patch_size: int = 3,
 ) -> None:
     """Save anatomy, observed PSC, the three components, tissue labels, traces and spectra.
 
@@ -225,24 +235,35 @@ def _save_visualization(
     gm_dyn, gm_clean, gm_noise, gm_resid = (v[:, gm] for v in (dyn, clean, noise, residual))
     if gm_dyn.shape[1]:
         voxel = int(gm_dyn.std(dim=0, unbiased=False).argsort()[gm_dyn.shape[1] // 2])
+        coordinates = gm.nonzero(as_tuple=False)[voxel]
+        anchor = tuple(int(value) for value in coordinates)
+        patch_dyn = gm_local_patch_trace(dyn, gm, anchor, temporal_patch_size)
+        patch_clean = gm_local_patch_trace(clean, gm, anchor, temporal_patch_size)
+        patch_noise = gm_local_patch_trace(noise, gm, anchor, temporal_patch_size)
+        global_dyn = gm_dyn.mean(1)
+        global_clean = gm_clean.mean(1)
         trace_axis = flat_axes[6]
-        trace_axis.plot(seconds, gm_dyn[:, voxel], label="observed")
-        trace_axis.plot(seconds, gm_clean[:, voxel], label="clean S")
-        trace_axis.plot(seconds, gm_noise[:, voxel], label="phys. N")
-        trace_axis.set_title("Median-variance GM voxel")
+        trace_axis.plot(seconds, gm_dyn[:, voxel], color="gray", alpha=0.25, linewidth=0.7, label="center voxel")
+        trace_axis.plot(seconds, patch_dyn, label="observed GM patch")
+        trace_axis.plot(seconds, patch_clean, label="clean GM patch")
+        trace_axis.plot(seconds, patch_noise, label="phys. N patch")
+        trace_axis.plot(seconds, global_dyn, linestyle="--", label="global GM observed")
+        trace_axis.plot(seconds, global_clean, linestyle="--", label="global GM clean")
+        trace_axis.set_title(f"GM patch ({temporal_patch_size}x around {anchor})")
         trace_axis.set_xlabel("Time (s)")
         trace_axis.set_ylabel("PSC (%)")
         trace_axis.legend(fontsize=7)
 
         spectrum_axis = flat_axes[7]
         for label, series in (
-            ("observed", gm_dyn),
-            ("clean S", gm_clean),
-            ("phys. N", gm_noise),
-            ("residual e", gm_resid),
+            ("observed patch", patch_dyn),
+            ("clean patch", patch_clean),
+            ("phys. N patch", patch_noise),
+            ("global GM observed", global_dyn),
+            ("global GM clean", global_clean),
         ):
-            centered = series - series.mean(0, keepdim=True)
-            power = torch.fft.rfft(centered, dim=0).abs().square().mean(1)[1:]
+            centered = series - series.mean(0)
+            power = torch.fft.rfft(centered, dim=0).abs().square()[1:]
             frequency = torch.fft.rfftfreq(series.shape[0], d=tr)[1:]
             spectrum_axis.plot(frequency, power / power.sum().clamp_min(1e-12), label=label)
         spectrum_axis.axvspan(0.01, 0.15, color="grey", alpha=0.15)
@@ -260,7 +281,12 @@ def _save_visualization(
 
 
 def _window_metrics(
-    sample: torch.Tensor, clean: torch.Tensor, noise: torch.Tensor, tr: float
+    sample: torch.Tensor,
+    clean: torch.Tensor,
+    noise: torch.Tensor,
+    tr: float,
+    temporal_patch_size: int = 3,
+    erosion_iterations: int = 1,
 ) -> dict[str, float | None]:
     """Held-out fit and dynamic diagnostics for one window (all tensors on one device)."""
     dyn = sample[DYN]
@@ -272,7 +298,19 @@ def _window_metrics(
         "mse_brain": float(residual.square().mean()),
         "r2_brain": float(1.0 - residual.square().sum() / energy),
     }
-    metrics.update(dynamic_metrics(dyn, clean, noise, gm, tr))
+    metrics.update(
+        dynamic_metrics(
+            dyn,
+            clean,
+            noise,
+            gm,
+            tr,
+            temporal_patch_size=temporal_patch_size,
+            wm_mask=sample[WM, 0],
+            csf_mask=sample[CSF, 0],
+            erosion_iterations=erosion_iterations,
+        )
+    )
     return metrics
 
 
@@ -324,6 +362,9 @@ def run_evaluation(args: argparse.Namespace, model: fMRIDenoisingLightning | Non
         raise ValueError("--time_frames and --mask_repeats must be positive and --K >= 2.")
     if args.visual_examples_per_subject < 0 or args.max_windows_per_subject < 0:
         raise ValueError("Counts cannot be negative.")
+    temporal_patch_size = getattr(args, "temporal_patch_size", 3)
+    if temporal_patch_size < 1:
+        raise ValueError("--temporal_patch_size must be positive.")
 
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     if not checkpoint_path.is_file():
@@ -417,7 +458,13 @@ def run_evaluation(args: argparse.Namespace, model: fMRIDenoisingLightning | Non
                     f"{int(entry['start']):06d}-{int(entry['stop']):06d}.png"
                 )
                 _save_visualization(
-                    visualization_dir / role / filename, sample, clean, noise, entry, float(tr[0])
+                    visualization_dir / role / filename,
+                    sample,
+                    clean,
+                    noise,
+                    entry,
+                    float(tr[0]),
+                    temporal_patch_size,
                 )
                 saved = True
 
@@ -432,7 +479,16 @@ def run_evaluation(args: argparse.Namespace, model: fMRIDenoisingLightning | Non
                     "K": args.K,
                     "inference_mode": getattr(args, "inference_mode", "kpass"),
                 }
-                row.update(_window_metrics(sample, clean, noise, float(tr[0])))
+                row.update(
+                    _window_metrics(
+                        sample,
+                        clean,
+                        noise,
+                        float(tr[0]),
+                        temporal_patch_size,
+                        int(getattr(model.hparams, "erosion_iterations", 1)),
+                    )
+                )
                 window_rows.append(row)
             print(
                 f"[{role}] {subject} {entry['run']} frames {entry['start']}:{entry['stop']} "
@@ -480,6 +536,7 @@ def run_evaluation(args: argparse.Namespace, model: fMRIDenoisingLightning | Non
         "K": args.K,
         "inference_mode": getattr(args, "inference_mode", "kpass"),
         "mask_repeats": args.mask_repeats,
+        "temporal_patch_size": temporal_patch_size,
         "seed": args.seed,
         "detrend": args.detrend,
         "tr_override": args.tr,

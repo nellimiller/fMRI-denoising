@@ -8,6 +8,11 @@ import matplotlib.pyplot as plt
 import torch
 from lightning.pytorch.callbacks import Callback
 
+try:
+    from .temporal_metrics import gm_local_patch_trace
+except ImportError:
+    from utils.temporal_metrics import gm_local_patch_trace
+
 
 def crop_to_input(prediction: torch.Tensor, input_sample: torch.Tensor) -> torch.Tensor:
     """Crop padded predictions to a dataset sample's original spatial extent."""
@@ -43,12 +48,20 @@ class ValidationVisualizationCallback(Callback):
     directly comparable.
     """
 
-    def __init__(self, output_dir: str | Path, every_n_epochs: int = 1, K: int = 4, seed: int = 1234) -> None:
+    def __init__(
+        self,
+        output_dir: str | Path,
+        every_n_epochs: int = 1,
+        K: int = 4,
+        seed: int = 1234,
+        temporal_patch_size: int = 3,
+    ) -> None:
         super().__init__()
         self.output_dir = Path(output_dir)
         self.every_n_epochs = every_n_epochs
         self.K = K
         self.seed = seed
+        self.temporal_patch_size = temporal_patch_size
 
     def on_validation_epoch_end(self, trainer, pl_module) -> None:
         if trainer.sanity_checking or trainer.current_epoch % self.every_n_epochs:
@@ -80,6 +93,7 @@ class ValidationVisualizationCallback(Callback):
         noise = crop_to_input(result["noise"], item["x"])[0, 0].detach().cpu()
         dyn = item["x"][0].cpu()
         brain = item["x"][5, 0] > 0
+        gm = item["x"][2, 0].cpu() > 0
         time_index = dyn.shape[0] // 2
         scores = brain.sum(dim=(0, 1))
         spatial_slice = int(scores.argmax()) if bool(scores.any()) else dyn.shape[-1] // 2
@@ -99,11 +113,42 @@ class ValidationVisualizationCallback(Callback):
             ),
         ]
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        figure, axes = plt.subplots(1, len(panels), figsize=(18, 4))
+        figure, axes = plt.subplots(1, len(panels) + 2, figsize=(24, 4))
         for axis, (title, image, cmap, lower, upper) in zip(axes, panels):
             axis.imshow(image.numpy(), cmap=cmap, vmin=lower, vmax=upper)
             axis.set_title(title)
             axis.axis("off")
+        if bool(gm.any()):
+            coordinates = gm.nonzero(as_tuple=False)
+            gm_values = dyn[:, gm]
+            voxel = int(gm_values.std(dim=0, unbiased=False).argsort()[len(coordinates) // 2])
+            anchor = tuple(int(value) for value in coordinates[voxel])
+            patch_input = gm_local_patch_trace(dyn, gm, anchor, self.temporal_patch_size)
+            patch_clean = gm_local_patch_trace(clean, gm, anchor, self.temporal_patch_size)
+            global_input = gm_values.mean(1)
+            global_clean = clean[:, gm].mean(1)
+            seconds = torch.arange(dyn.shape[0]).float() * float(item["tr"])
+            axes[-2].plot(seconds, patch_input, label="observed GM patch")
+            axes[-2].plot(seconds, patch_clean, label="clean GM patch")
+            axes[-2].plot(seconds, global_input, linestyle="--", label="global GM observed")
+            axes[-2].plot(seconds, global_clean, linestyle="--", label="global GM clean")
+            axes[-2].set_title(f"GM-masked {self.temporal_patch_size}x patch")
+            axes[-2].set_xlabel("Time (s)")
+            axes[-2].legend(fontsize=6)
+            frequency = torch.fft.rfftfreq(dyn.shape[0], d=float(item["tr"]))[1:]
+            for label, trace in (
+                ("observed patch", patch_input),
+                ("clean patch", patch_clean),
+                ("global GM observed", global_input),
+                ("global GM clean", global_clean),
+            ):
+                centered = trace - trace.mean()
+                power = torch.fft.rfft(centered, dim=0).abs().square()[1:]
+                axes[-1].plot(frequency, power / power.sum().clamp_min(1e-12), label=label)
+            axes[-1].axvspan(0.01, 0.15, color="grey", alpha=0.15)
+            axes[-1].set_title("Patch/global GM PSD")
+            axes[-1].set_xlabel("Frequency (Hz)")
+            axes[-1].legend(fontsize=6)
         figure.suptitle(
             f"epoch={trainer.current_epoch} time={time_index} z={spatial_slice} K={self.K}"
         )

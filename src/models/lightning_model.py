@@ -172,10 +172,26 @@ class fMRIDenoisingLightning(L.LightningModule):
                 sync_dist=True,
                 batch_size=batch_size,
             )
+            self.log(
+                f"{phase}/{name}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
         valid = out["valid"].float().sum().clamp_min(1.0)
         self.log(
             f"{phase}_mask_fraction",
             out["token_mask"].float().sum() / valid,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            f"{phase}/mask_fraction",
+            out["token_mask"].float().sum() / valid,
+            on_step=False,
+            on_epoch=True,
             sync_dist=True,
             batch_size=batch_size,
         )

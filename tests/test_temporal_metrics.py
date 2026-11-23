@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from utils.region_guided import region_guided_projection
-from utils.temporal_metrics import temporal_metrics
+from utils.temporal_metrics import dynamic_metrics, temporal_metrics
 
 
 def _synthetic_regions() -> tuple[torch.Tensor, ...]:
@@ -50,8 +50,6 @@ def test_temporal_metrics_reject_time_varying_masks() -> None:
 
 
 def test_dynamic_metrics_decomposition_shares_tsnr_and_band_power() -> None:
-    from utils.temporal_metrics import dynamic_metrics
-
     T = 40
     t = torch.arange(T).float()
     gm = torch.ones(2, 2, 2)
@@ -77,10 +75,41 @@ def test_dynamic_metrics_decomposition_shares_tsnr_and_band_power() -> None:
 
 
 def test_dynamic_metrics_validates_inputs() -> None:
-    from utils.temporal_metrics import dynamic_metrics
-
     x = torch.randn(8, 2, 2, 2)
     with pytest.raises(ValueError):
         dynamic_metrics(x, x[:4], x, torch.ones(2, 2, 2), 1.0)
     with pytest.raises(ValueError):
         dynamic_metrics(x, x, x, torch.zeros(2, 2, 2), 1.0)
+
+
+def test_dynamic_metrics_adds_patch_and_lightweight_diagnostics() -> None:
+    T, shape = 20, (3, 3, 3)
+    signal = torch.sin(2 * torch.pi * 0.1 * torch.arange(T).float())
+    clean = signal[:, None, None, None].expand(T, *shape).clone()
+    dyn = clean + 0.1 * torch.randn(T, *shape, generator=torch.Generator().manual_seed(2))
+    noise = torch.zeros_like(clean)
+    gm = torch.ones(shape, dtype=torch.bool)
+    wm = torch.zeros(shape, dtype=torch.bool)
+    csf = torch.zeros(shape, dtype=torch.bool)
+    wm[0, 0, 0] = True
+
+    metrics = dynamic_metrics(
+        dyn,
+        clean,
+        noise,
+        gm,
+        tr=1.0,
+        temporal_patch_size=3,
+        wm_mask=wm,
+        csf_mask=csf,
+        erosion_iterations=0,
+    )
+
+    assert metrics["gm_patch_corr_clean_input_median"] > 0.99
+    assert metrics["clean_active_voxel_frac"] == pytest.approx(1.0)
+    assert metrics["gm_patch_tsnr_before"] is not None
+    assert metrics["gm_patch_tsnr_after"] is not None
+    assert metrics["gm_patch_band_power_frac"] > 0.99
+    assert metrics["wm_csf_leakage_ratio"] is not None
+    assert metrics["gm_spatial_grad_ratio"] is not None
+    assert metrics["residual_lag1_acf"] is not None

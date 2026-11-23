@@ -36,14 +36,14 @@ try:
     from .data.nsd_dataset import NSDDataset
     from .models.lightning_model import fMRIDenoisingLightning
     from .utils.region_guided import region_guided_projection
-    from .utils.temporal_metrics import dynamic_metrics, temporal_metrics
+    from .utils.temporal_metrics import dynamic_metrics, gm_local_patch_trace, temporal_metrics
     from .utils.tissue import erode_mask
 except ImportError:
     from data.channels import CSF, DYN, GM, WM
     from data.nsd_dataset import NSDDataset
     from models.lightning_model import fMRIDenoisingLightning
     from utils.region_guided import region_guided_projection
-    from utils.temporal_metrics import dynamic_metrics, temporal_metrics
+    from utils.temporal_metrics import dynamic_metrics, gm_local_patch_trace, temporal_metrics
     from utils.tissue import erode_mask
 
 
@@ -63,6 +63,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Evenly-spaced windows per subject; use 0 for all windows",
     )
     parser.add_argument("--plots_per_subject", type=int, default=3)
+    parser.add_argument(
+        "--temporal_patch_size",
+        type=int,
+        default=3,
+        help="Side length of contiguous GM-masked temporal patches",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--detrend", default="run", choices=["run", "window", "run+window", "none"])
     parser.add_argument("--tr", type=float, default=None, help="Repetition time override (seconds)")
@@ -110,8 +116,9 @@ def _save_temporal_plot(
     estimates: dict[str, tuple[Tensor, Tensor]],
     tr: float,
     entry: dict[str, Any],
+    temporal_patch_size: int,
 ) -> None:
-    """Traces of one median-variance GM voxel, tissue traces and GM power spectra."""
+    """Plot local GM-patch and global GM-ROI traces and power spectra."""
     dyn = sample[DYN]
     gm_mask, wm_mask, csf_mask = (sample[c, 0] > 0 for c in (GM, WM, CSF))
     gm_coordinates = gm_mask.nonzero(as_tuple=False)
@@ -121,30 +128,58 @@ def _save_temporal_plot(
     voxel = int(gm_values.std(dim=0, unbiased=False).argsort()[len(gm_coordinates) // 2])
     x, y, z = (int(v) for v in gm_coordinates[voxel])
     seconds = torch.arange(dyn.shape[0]).float() * tr
+    patch_signals = {
+        label: gm_local_patch_trace(
+            signal, gm_mask, (x, y, z), temporal_patch_size
+        )
+        for label, signal in {
+            "observed": dyn,
+            **{f"{name} clean": clean for name, (clean, _) in estimates.items()},
+        }.items()
+    }
+    if "model" in estimates:
+        patch_signals["model physiological noise"] = gm_local_patch_trace(
+            estimates["model"][1], gm_mask, (x, y, z), temporal_patch_size
+        )
+    global_signals = {
+        label: signal[:, gm_mask].mean(1)
+        for label, signal in {
+            "observed": dyn,
+            **{f"{name} clean": clean for name, (clean, _) in estimates.items()},
+        }.items()
+    }
+    if "model" in estimates:
+        global_signals["model physiological noise"] = estimates["model"][1][:, gm_mask].mean(1)
 
     figure, axes = plt.subplots(1, 2, figsize=(14, 4))
-    axes[0].plot(seconds, dyn[:, x, y, z], label="Observed GM voxel", linewidth=1.3)
-    for name, (clean, noise) in estimates.items():
-        axes[0].plot(seconds, clean[:, x, y, z], label=f"{name}: clean", linewidth=1.3)
-        if name == "model":
-            axes[0].plot(seconds, noise[:, x, y, z], label="model: phys. noise", linewidth=1.0, linestyle=":")
+    axes[0].plot(
+        seconds, dyn[:, x, y, z], color="gray", alpha=0.25, linewidth=0.7,
+        label="Observed center voxel",
+    )
+    for label, signal in patch_signals.items():
+        axes[0].plot(seconds, signal, label=f"{label} GM patch", linewidth=1.3)
+    for label, signal in global_signals.items():
+        axes[0].plot(seconds, signal, label=f"{label} global GM", linewidth=1.0, linestyle="--")
     axes[0].plot(seconds, dyn[:, wm_mask].mean(1), label="WM mean", linewidth=1.0, alpha=0.7)
     axes[0].plot(seconds, dyn[:, csf_mask].mean(1), label="CSF mean", linewidth=1.0, alpha=0.7)
-    axes[0].set_title(f"GM voxel ({x}, {y}, {z}) traces")
+    axes[0].set_title(
+        f"GM-masked {temporal_patch_size}x{temporal_patch_size}x{temporal_patch_size} "
+        f"patch around ({x}, {y}, {z})"
+    )
     axes[0].set_xlabel("Time (s)")
     axes[0].set_ylabel("Percent signal change")
     axes[0].legend(fontsize=7)
 
-    spectra = {"Observed GM": gm_values}
-    spectra.update({f"{name} clean GM": clean[:, gm_mask] for name, (clean, _) in estimates.items()})
+    spectra = {f"{label} patch": signal for label, signal in patch_signals.items()}
+    spectra.update({f"{label} global": signal for label, signal in global_signals.items()})
     frequency = torch.fft.rfftfreq(dyn.shape[0], d=tr)[1:]
     for label, signal in spectra.items():
-        centered = signal.float() - signal.float().mean(0, keepdim=True)
+        centered = signal.float() - signal.float().mean()
         power = torch.fft.rfft(centered, dim=0).abs().square()[1:]
-        power = power / power.sum(0, keepdim=True).clamp_min(1e-12)
-        axes[1].plot(frequency, power.mean(1), label=label, linewidth=1.3)
+        power = power / power.sum().clamp_min(1e-12)
+        axes[1].plot(frequency, power, label=label, linewidth=1.3)
     axes[1].axvspan(0.01, 0.15, color="grey", alpha=0.15)
-    axes[1].set_title("Mean per-voxel GM power spectrum")
+    axes[1].set_title("GM patch and global-ROI power spectra")
     axes[1].set_xlabel("Frequency (Hz)")
     axes[1].set_ylabel("Fraction of non-DC power")
     axes[1].legend(fontsize=7)
@@ -180,6 +215,8 @@ def main() -> None:
     args = parse_args()
     if args.time_frames < 2 or args.K < 2:
         raise ValueError("--time_frames must be >= 2 and --K >= 2.")
+    if args.temporal_patch_size < 1:
+        raise ValueError("--temporal_patch_size must be positive.")
     if args.max_windows_per_subject < 0 or args.plots_per_subject < 0:
         raise ValueError("Counts cannot be negative.")
 
@@ -243,7 +280,19 @@ def main() -> None:
                     "stop": int(entry["stop"]),
                     "method": method,
                 }
-                row.update(dynamic_metrics(dyn, clean, noise, sample[GM, 0], tr_value))
+                row.update(
+                    dynamic_metrics(
+                        dyn,
+                        clean,
+                        noise,
+                        sample[GM, 0],
+                        tr_value,
+                        temporal_patch_size=args.temporal_patch_size,
+                        wm_mask=sample[WM, 0],
+                        csf_mask=sample[CSF, 0],
+                        erosion_iterations=erosion,
+                    )
+                )
                 row.update(temporal_metrics(dyn, clean, sample[GM], sample[WM], sample[CSF]))
                 rows.append(row)
 
@@ -258,6 +307,7 @@ def main() -> None:
                     {k: (c.cpu(), n.cpu()) for k, (c, n) in estimates.items()},
                     tr_value,
                     entry,
+                    args.temporal_patch_size,
                 )
             print(
                 f"Temporal evaluation {entry['subject']} {entry['run']} "
@@ -272,6 +322,7 @@ def main() -> None:
         "subjects": sorted(subjects),
         "time_frames": args.time_frames,
         "K": args.K,
+        "temporal_patch_size": args.temporal_patch_size,
         "windows_per_subject": args.max_windows_per_subject or "all",
         "num_windows": len(selected),
         "methods": _summarize(rows),

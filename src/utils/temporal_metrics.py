@@ -7,11 +7,15 @@ from torch import Tensor
 
 try:
     from .spectral import band_power_fraction
+    from .tissue import erode_mask
 except ImportError:
     from utils.spectral import band_power_fraction
+    from utils.tissue import erode_mask
 
 
-def _static_mask(mask: Tensor, bold: Tensor, name: str) -> Tensor:
+def _static_mask(
+    mask: Tensor, bold: Tensor, name: str, require_nonempty: bool = True
+) -> Tensor:
     if not torch.isfinite(mask).all():
         raise ValueError(f"{name} mask contains non-finite values.")
     if mask.ndim == 4:
@@ -31,7 +35,7 @@ def _static_mask(mask: Tensor, bold: Tensor, name: str) -> Tensor:
             f"BOLD spatial shape {tuple(bold.shape[1:])}."
         )
     mask = mask.to(device=bold.device) > 0
-    if not bool(mask.any()):
+    if require_nonempty and not bool(mask.any()):
         raise ValueError(f"{name} mask is empty.")
     return mask
 
@@ -162,6 +166,62 @@ def temporal_metrics(
     }
 
 
+def gm_patch_traces(
+    data: Tensor, gm_mask: Tensor, patch_size: int = 3
+) -> tuple[Tensor, Tensor]:
+    """Return GM-masked means for non-overlapping contiguous 3D patches."""
+    if data.ndim != 4:
+        raise ValueError(f"Expected data [T,X,Y,Z], got {tuple(data.shape)}.")
+    if patch_size <= 0:
+        raise ValueError("patch_size must be positive.")
+    gm = _static_mask(gm_mask, data, "GM")
+    traces: list[Tensor] = []
+    anchors: list[tuple[int, int, int]] = []
+    x_size, y_size, z_size = gm.shape
+    for x in range(0, x_size, patch_size):
+        for y in range(0, y_size, patch_size):
+            for z in range(0, z_size, patch_size):
+                patch = gm[
+                    x : min(x + patch_size, x_size),
+                    y : min(y + patch_size, y_size),
+                    z : min(z + patch_size, z_size),
+                ]
+                if not bool(patch.any()):
+                    continue
+                values = data[
+                    :,
+                    x : min(x + patch_size, x_size),
+                    y : min(y + patch_size, y_size),
+                    z : min(z + patch_size, z_size),
+                ][:, patch]
+                traces.append(values.float().mean(1))
+                anchors.append((x, y, z))
+    if not traces:
+        raise ValueError("GM mask contains no valid patches.")
+    anchor_tensor = torch.tensor(anchors, device=data.device, dtype=torch.int64)
+    return torch.stack(traces, dim=1), anchor_tensor
+
+
+def gm_local_patch_trace(
+    data: Tensor, gm_mask: Tensor, anchor: tuple[int, int, int], patch_size: int = 3
+) -> Tensor:
+    """Average a GM-masked cubic neighborhood centered on an anchor voxel."""
+    if data.ndim != 4:
+        raise ValueError(f"Expected data [T,X,Y,Z], got {tuple(data.shape)}.")
+    if patch_size <= 0:
+        raise ValueError("patch_size must be positive.")
+    gm = _static_mask(gm_mask, data, "GM")
+    radius = patch_size // 2
+    x, y, z = anchor
+    x_start, x_stop = max(0, x - radius), min(gm.shape[0], x - radius + patch_size)
+    y_start, y_stop = max(0, y - radius), min(gm.shape[1], y - radius + patch_size)
+    z_start, z_stop = max(0, z - radius), min(gm.shape[2], z - radius + patch_size)
+    patch_mask = gm[x_start:x_stop, y_start:y_stop, z_start:z_stop]
+    if not bool(patch_mask.any()):
+        raise ValueError("Selected temporal patch contains no GM voxels.")
+    return data[:, x_start:x_stop, y_start:y_stop, z_start:z_stop][:, patch_mask].float().mean(1)
+
+
 def _temporal_correlations(left: Tensor, right: Tensor, eps: float) -> Tensor:
     centered_left = left - left.mean(dim=0, keepdim=True)
     centered_right = right - right.mean(dim=0, keepdim=True)
@@ -182,6 +242,10 @@ def dynamic_metrics(
     tr: float,
     band: tuple[float, float] = (0.01, 0.15),
     eps: float = 1e-8,
+    temporal_patch_size: int = 3,
+    wm_mask: Tensor | None = None,
+    csf_mask: Tensor | None = None,
+    erosion_iterations: int = 1,
 ) -> dict[str, float | None]:
     """fMRI-specific diagnostics of a ``dyn = clean + noise + e`` decomposition inside GM.
 
@@ -242,6 +306,43 @@ def dynamic_metrics(
     centred_x = x - x.mean(0, keepdim=True)
     energy = centred_x.square().sum().clamp_min(eps)
 
+    patch_input, _ = gm_patch_traces(dyn, gm, temporal_patch_size)
+    patch_clean, _ = gm_patch_traces(clean, gm, temporal_patch_size)
+    patch_tsnr_input = tsnr(patch_input)
+    patch_tsnr_clean = tsnr(patch_clean)
+    clean_var = s.var(dim=0, unbiased=False)
+    input_var = x.var(dim=0, unbiased=False)
+
+    left = e[:-1] - e[:-1].mean(0, keepdim=True)
+    right = e[1:] - e[1:].mean(0, keepdim=True)
+    residual_denominator = left.norm(0) * right.norm(0)
+    residual_valid = residual_denominator > eps
+    residual_corr = (left * right).sum(0) / residual_denominator.clamp_min(eps)
+
+    spatial_grad_ratio = None
+    if all(size > 1 for size in clean.shape[1:]):
+        input_grad = torch.gradient(dyn.float(), dim=(1, 2, 3))
+        clean_grad = torch.gradient(clean.float(), dim=(1, 2, 3))
+        input_norm = torch.stack(input_grad).square().sum(0).sqrt()
+        clean_norm = torch.stack(clean_grad).square().sum(0).sqrt()
+        input_mean = input_norm[:, gm].mean()
+        clean_mean = clean_norm[:, gm].mean()
+        spatial_grad_ratio = float(clean_mean / input_mean.clamp_min(eps))
+
+    leakage_ratio = None
+    if wm_mask is not None and csf_mask is not None:
+        wm = _static_mask(wm_mask, dyn, "WM", require_nonempty=False)
+        csf = _static_mask(csf_mask, dyn, "CSF", require_nonempty=False)
+        wm_csf = torch.logical_or(
+            erode_mask(wm.unsqueeze(0).unsqueeze(0), erosion_iterations)[0, 0],
+            erode_mask(csf.unsqueeze(0).unsqueeze(0), erosion_iterations)[0, 0],
+        )
+        if bool(wm_csf.any()):
+            leakage_ratio = float(
+                clean[:, wm_csf].float().var(dim=0, unbiased=False).mean()
+                / clean_var.mean().clamp_min(1e-8)
+            )
+
     metrics: dict[str, float | None] = {
         "gm_corr_clean_input_median": _median_finite(correlation(s, x)),
         "gm_corr_recon_input_median": _median_finite(correlation(s + n, x)),
@@ -256,6 +357,18 @@ def dynamic_metrics(
         "var_resid_frac": float(shares["resid"]),
         "var_cross_frac": float(1.0 - sum(shares.values())),
         "r2_gm": float(1.0 - (e - e.mean(0, keepdim=True)).square().sum() / energy),
+        "clean_active_voxel_frac": float((clean_var > 0.05 * input_var).float().mean()),
+        "wm_csf_leakage_ratio": leakage_ratio,
+        "gm_spatial_grad_ratio": spatial_grad_ratio,
+        "residual_lag1_acf": _median_valid(residual_corr, residual_valid),
+        "gm_patch_corr_clean_input_median": _median_finite(
+            correlation(patch_clean, patch_input)
+        ),
+        "gm_patch_tsnr_before": _median_finite(patch_tsnr_input),
+        "gm_patch_tsnr_after": _median_finite(patch_tsnr_clean),
+        "gm_patch_band_power_frac": _median_finite(
+            band_power_fraction(patch_clean, tr, band[0], band[1])
+        ),
     }
     for name, series in (("input", x), ("clean", s), ("noise", n), ("resid", e)):
         metrics[f"band_power_frac_{name}_median"] = _median_finite(

@@ -14,6 +14,7 @@ validation and test subjects (unless ``--skip_final_eval``).
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import subprocess
@@ -23,7 +24,7 @@ from typing import Any
 
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader, Subset
 
@@ -161,6 +162,37 @@ class NSDDataModule(L.LightningDataModule):
         )
 
 
+class EpochMetricsCSVCallback(Callback):
+    """Write stable per-epoch train/validation scalars directly under the run root."""
+
+    def __init__(self, output_path: str | Path) -> None:
+        super().__init__()
+        self.output_path = Path(output_path)
+        self.rows: list[dict[str, Any]] = []
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        if trainer.sanity_checking or not trainer.is_global_zero:
+            return
+        row: dict[str, Any] = {"epoch": trainer.current_epoch}
+        optimizer = trainer.optimizers[0] if trainer.optimizers else None
+        row["lr"] = (
+            float(optimizer.param_groups[0]["lr"]) if optimizer and optimizer.param_groups else None
+        )
+        for name, value in trainer.callback_metrics.items():
+            if not (name.startswith("train/") or name.startswith("val/")):
+                continue
+            scalar = value.detach().float().item() if torch.is_tensor(value) else value
+            if isinstance(scalar, (float, int)):
+                row[name] = float(scalar)
+        if any(name.startswith("train/") or name.startswith("val/") for name in row):
+            self.rows.append(row)
+            fieldnames = list(dict.fromkeys(key for record in self.rows for key in record))
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.output_path.open("w", newline="", encoding="utf-8") as output:
+                writer = csv.DictWriter(output, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.rows)
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -236,6 +268,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Final evaluation
     parser.add_argument("--skip_final_eval", action="store_true")
     parser.add_argument("--eval_K", type=int, default=4, help="Complementary masks for inference")
+    parser.add_argument("--temporal_patch_size", type=int, default=3)
     parser.add_argument("--final_eval_windows_per_subject", type=int, default=24, help="0 = all windows")
     parser.add_argument("--eval_dir", default=None, help="Default: <checkpoint_dir>/final_evaluation")
 
@@ -245,6 +278,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--name", default="SwinMAE-NSD")
     parser.add_argument("--log_dir", default="logs_nsd")
     parser.add_argument("--checkpoint_dir", default="checkpoints_nsd")
+    parser.add_argument("--run_dir", default=None, help="Run root containing epoch_metrics.csv")
+    parser.add_argument("--resume_checkpoint", default=None, help="Lightning checkpoint to resume from")
     parser.add_argument("--visualization_dir", default="validation_visualizations")
     parser.add_argument("--visualize_every_n_epochs", type=int, default=1)
 
@@ -278,6 +313,8 @@ def validate_args(args: argparse.Namespace) -> None:
     overlap = set(args.test_subjects) & set(args.subjects or [])
     if overlap:
         raise ValueError(f"Test subjects must not be in --subjects: {sorted(overlap)}")
+    if args.temporal_patch_size <= 0:
+        raise ValueError("--temporal_patch_size must be positive.")
 
 
 def _git_commit() -> str | None:
@@ -354,6 +391,8 @@ def run_final_evaluation(args: argparse.Namespace, checkpoint: Path, datamodule:
         detrend=args.detrend,
         tr=args.tr,
         amp=False,
+        temporal_patch_size=args.temporal_patch_size,
+        inference_mode="kpass",
     )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -418,26 +457,39 @@ def main(argv: list[str] | None = None) -> None:
     if args.use_wandb:
         loggers.append(WandbLogger(project=args.project, name=args.name))
 
-    # The Lightning module logs the combined objective as val_total.
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_total",
+    best_checkpoint_callback = ModelCheckpoint(
+        monitor="val/total",
         mode="min",
-        save_top_k=3,
+        save_top_k=1,
         dirpath=checkpoint_dir,
-        filename="swinmae-nsd-{epoch:02d}-{val_total:.4f}",
+        filename="best",
         save_last=True,
     )
+    periodic_checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename="epoch_{epoch:02d}",
+        save_top_k=-1,
+        every_n_epochs=5,
+        save_on_train_epoch_end=True,
+    )
+    run_dir = Path(args.run_dir) if args.run_dir else checkpoint_dir.parent
     visualization_callback = ValidationVisualizationCallback(
         output_dir=args.visualization_dir,
         every_n_epochs=args.visualize_every_n_epochs,
         K=args.eval_K,
         seed=args.seed,
+        temporal_patch_size=args.temporal_patch_size,
     )
-    callbacks = [checkpoint_callback, visualization_callback]
+    callbacks = [
+        best_checkpoint_callback,
+        periodic_checkpoint_callback,
+        visualization_callback,
+        EpochMetricsCSVCallback(run_dir / "epoch_metrics.csv"),
+    ]
     if args.early_stopping_patience:
         callbacks.append(
             EarlyStopping(
-                monitor="val_total",
+                monitor="val/total",
                 mode="min",
                 patience=args.early_stopping_patience,
                 check_finite=True,
@@ -458,16 +510,20 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     print("Starting training...")
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(
+        model,
+        datamodule=datamodule,
+        ckpt_path=str(Path(args.resume_checkpoint).expanduser()) if args.resume_checkpoint else None,
+    )
 
     if not trainer.is_global_zero:
         return
-    best = checkpoint_callback.best_model_path or checkpoint_callback.last_model_path
+    best = best_checkpoint_callback.best_model_path or best_checkpoint_callback.last_model_path
     extra: dict[str, Any] = {
         "best_checkpoint": best,
         "best_val_total": (
-            float(checkpoint_callback.best_model_score)
-            if checkpoint_callback.best_model_score is not None
+            float(best_checkpoint_callback.best_model_score)
+            if best_checkpoint_callback.best_model_score is not None
             else None
         ),
     }
