@@ -61,4 +61,6 @@ uv run --no-sync python -m src.evaluate_temporal \
     --max_windows_per_subject "${TEMPORAL_MAX_WINDOWS_PER_SUBJECT:-12}" \
     --plots_per_subject "${TEMPORAL_PLOTS_PER_SUBJECT:-3}" \
     --seed "${EVAL_SEED:-1234}" \
+    --K "${EVAL_K:-4}" \
+    --detrend "${EVAL_DETREND:-run}" \
     "${EVAL_CROP_ARGS[@]}"

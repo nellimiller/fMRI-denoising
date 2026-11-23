@@ -37,14 +37,18 @@ if [[ ${#EVAL_SUBJECTS_ARRAY[@]} -eq 0 ]]; then
     exit 1
 fi
 
+read -r -a EVAL_VALIDATION_ARRAY <<< "${EVAL_VALIDATION_SUBJECTS:-subj07}"
 VISUAL_SPLIT_ARGS=()
 if [[ -n "${EVAL_TRAIN_VISUAL_SUBJECTS:-}" ]]; then
     read -r -a EVAL_TRAIN_VISUAL_ARRAY <<< "$EVAL_TRAIN_VISUAL_SUBJECTS"
     VISUAL_SPLIT_ARGS+=(--train_visual_subjects "${EVAL_TRAIN_VISUAL_ARRAY[@]}")
 fi
-if [[ -n "${EVAL_VALIDATION_VISUAL_SUBJECTS:-}" ]]; then
-    read -r -a EVAL_VALIDATION_VISUAL_ARRAY <<< "$EVAL_VALIDATION_VISUAL_SUBJECTS"
-    VISUAL_SPLIT_ARGS+=(--validation_visual_subjects "${EVAL_VALIDATION_VISUAL_ARRAY[@]}")
+if [[ ${#EVAL_VALIDATION_ARRAY[@]} -gt 0 && -n "${EVAL_VALIDATION_ARRAY[0]}" ]]; then
+    VISUAL_SPLIT_ARGS+=(--validation_subjects "${EVAL_VALIDATION_ARRAY[@]}")
+fi
+TR_ARGS=()
+if [[ -n "${EVAL_TR:-}" ]]; then
+    TR_ARGS=(--tr "$EVAL_TR")
 fi
 
 mkdir -p "$EVAL_DIR"
@@ -68,7 +72,7 @@ if [[ -n "${EVAL_CROP_SIZE:-}" ]]; then
 fi
 
 echo "Evaluating checkpoint: $CHECKPOINT"
-echo "Held-out subjects: ${EVAL_SUBJECTS_ARRAY[*]}"
+echo "Test subjects: ${EVAL_SUBJECTS_ARRAY[*]}; validation subjects: ${EVAL_VALIDATION_ARRAY[*]:-none}"
 
 uv run --no-sync python -m src.evaluate_nsd \
     --data_dir "$NSD_PROCESSED" \
@@ -77,7 +81,12 @@ uv run --no-sync python -m src.evaluate_nsd \
     --output_dir "$EVAL_DIR" \
     --time_frames "${EVAL_TIME_FRAMES:-40}" \
     --num_workers "${EVAL_NUM_WORKERS:-4}" \
+    --K "${EVAL_K:-4}" \
+    --inference_mode "${EVAL_INFERENCE_MODE:-kpass}" \
     --mask_repeats "${EVAL_MASK_REPEATS:-1}" \
+    --max_windows_per_subject "${EVAL_MAX_WINDOWS_PER_SUBJECT:-0}" \
+    --detrend "${EVAL_DETREND:-run}" \
+    "${TR_ARGS[@]}" \
     --seed "${EVAL_SEED:-1234}" \
     --visual_examples_per_subject "${EVAL_VISUAL_EXAMPLES_PER_SUBJECT:-3}" \
     "${VISUAL_SPLIT_ARGS[@]}" \

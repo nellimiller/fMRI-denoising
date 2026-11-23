@@ -1,248 +1,173 @@
-"""Masked MSE and structural tissue-based decomposition loss functions."""
+"""Identifiable objective for the asymmetric dual-head decomposition.
+
+In percent-signal-change space, inside the parenchymal brain mask::
+
+    X~(v,t) = S(v,t) + N(v,t) + e(v,t),      N(v,t) = sum_j beta_j(v) r_j(t)
+
+with ``S`` the band-limited, GM-gated clean signal and ``r_j`` nuisance regressors
+from visible eroded WM/CSF voxels. The loss is
+
+    L = w_rec  * L_rec                         masked-voxel reconstruction
+      + w_tis  * L_tissue                      clean suppression in eroded WM u CSF
+      + w_band * L_band                        out-of-band clean energy in GM
+      + w_ort  * L_ortho                       squared correlation clean vs. regressors
+
+where
+
+    L_rec    = sum_{v in M, t} e(v,t)^2 / (|M| T),   M = hidden voxels inside the brain
+    L_tissue = mean_{v in erode(WM) u erode(CSF), t} S_pre(v,t)^2
+    L_band   = mean_{v in GM} ||(I - B) S_pre(v,.)||^2 / T
+    L_ortho  = mean_{v in GM, j} rho(S(v,.), r_j)^2
+
+``S_pre`` is the clean head *before* gating and band-limiting: those architectural
+constraints make penalties on the final ``S`` vanish identically, which would leave the
+head weights unconstrained. With ``hard_bandpass=False`` (ablation) ``S_pre == S``.
+
+There is no DC-dominated unnormalised FFT term and no variance-of-masked-tensor
+``flat`` term.
+"""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange, repeat
+
+try:
+    from ..data.channels import BRAIN, CSF, DYN, GM, WM
+    from .spectral import band_weights, apply_band
+    from .tissue import erode_mask
+except ImportError:
+    from data.channels import BRAIN, CSF, DYN, GM, WM
+    from utils.spectral import apply_band, band_weights
+    from utils.tissue import erode_mask
 
 
-class StructuralDenoisingLoss(nn.Module):
-    """Calculates decomposition penalties based on anatomical tissue masks.
+def _masked_mean(values: torch.Tensor, weight: torch.Tensor, extra: int = 1) -> torch.Tensor:
+    """``sum(values * weight) / (sum(weight) * extra)`` with an empty-mask guard (returns 0)."""
+    denominator = weight.sum() * extra
+    return (values * weight).sum() / denominator.clamp_min(1.0)
 
-    Enforces that predicted clean BOLD signals have low temporal variance in
-    White Matter (WM) and CSF (which contain physiological noise), and that 
-    Grey Matter (GM) signals are orthogonal to the global noise summary.
+
+class IdentifiableDenoisingLoss(nn.Module):
+    """Masked-token reconstruction plus tissue, spectral and orthogonality priors.
 
     Args:
-        patch_size: Spatial patch dimension.
-        fft_weight: Penalty weight for frequency domain mismatch.
-        flat_weight: Penalty weight for temporal variance in WM/CSF.
-        ortho_weight: Penalty weight for GM/Noise orthogonality (Deep aCompCor).
-        merge_stages: Number of hierarchical downsampling stages.
+        rec_weight, tissue_weight, band_weight, ortho_weight: Term weights.
+        erosion_iterations: Erosion of WM/CSF for the tissue penalty (match the model).
+        band_low, band_high: Pass band in Hz (match the model).
+        eps: Numerical floor for correlations.
     """
 
     def __init__(
         self,
-        patch_size: int = 14,
-        fft_weight: float = 0.1,
-        flat_weight: float = 1.0,
-        ortho_weight: float = 1e-3,
-        merge_stages: int = 3,
+        rec_weight: float = 1.0,
+        tissue_weight: float = 1.0,
+        band_weight: float = 1.0,
+        ortho_weight: float = 0.1,
+        erosion_iterations: int = 1,
+        band_low: float = 0.01,
+        band_high: float = 0.15,
+        eps: float = 1e-6,
     ) -> None:
-        """Initialize loss weights and structural hyper-parameters."""
         super().__init__()
-        self.patch_size = patch_size
-        self.fft_weight = fft_weight
-        self.flat_weight = flat_weight
+        self.rec_weight = rec_weight
+        self.tissue_weight = tissue_weight
+        self.band_weight = band_weight
         self.ortho_weight = ortho_weight
-        self.grid_multiple = 2 ** merge_stages
-
-    def _extract_target_and_masks(
-        self, 
-        target: torch.Tensor, 
-        gm_mask: torch.Tensor | None = None, 
-        wm_mask: torch.Tensor | None = None, 
-        csf_mask: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Unpack concatenated targets or fall back to empty masks."""
-        # If dataset batches masks together with BOLD (Channels = 4)
-        if target.shape[1] >= 4:
-            target_bold = target[:, :1]
-            gm_mask = target[:, 1:2] if gm_mask is None else gm_mask
-            wm_mask = target[:, 2:3] if wm_mask is None else wm_mask
-            csf_mask = target[:, 3:4] if csf_mask is None else csf_mask
-            return target_bold, gm_mask, wm_mask, csf_mask
-
-        target_bold = target
-        gm_mask = torch.zeros_like(target_bold) if gm_mask is None else gm_mask
-        wm_mask = torch.zeros_like(target_bold) if wm_mask is None else wm_mask
-        csf_mask = torch.zeros_like(target_bold) if csf_mask is None else csf_mask
-
-        return target_bold, gm_mask, wm_mask, csf_mask
-
-    #def _masked_variance_over_time(self, x, mask):
-    #    # x: [B, C, T, X, Y, Z], mask: same shape; average temporal variance over voxels in mask
-    #    x = x * mask
-    #    var = x.var(dim=2, unbiased=False)
-    #    denom = mask.sum(dim=(2, 3, 4, 5), keepdim=True).clamp_min(1.0)
-    #    # var is [B, C, X, Y, Z]; we only care about the central channel and its spatial mask
-    #    return (var * mask[:, :, 0:1]).sum() / (mask[:, :, 0:1].sum().clamp_min(1.0))
+        self.erosion_iterations = erosion_iterations
+        self.band_low = band_low
+        self.band_high = band_high
+        self.eps = eps
 
     def forward(
-        self, 
-        clean_pred: torch.Tensor, 
-        noise_pred: torch.Tensor, 
-        target: torch.Tensor, 
-        gm_mask: torch.Tensor | None = None, 
-        wm_mask: torch.Tensor | None = None, 
-        csf_mask: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute the weighted structural loss components."""
-        target_bold, gm_mask, wm_mask, csf_mask = self._extract_target_and_masks(
-            target, gm_mask, wm_mask, csf_mask
-        )
-
-        gm_mask = gm_mask.float()
-        wm_mask = wm_mask.float()
-        csf_mask = csf_mask.float()
-
-        # Combine WM and CSF into a single physiological noise mask
-        tissue_mask = torch.maximum(wm_mask, csf_mask)
-
-        # 1. Standard reconstruction loss
-        total_pred = clean_pred + noise_pred
-        recon_loss = F.mse_loss(total_pred, target_bold)
-
-        # 2. L_flat: Penalize temporal variance of the *clean* prediction inside WM/CSF
-        clean_tissue = clean_pred * tissue_mask
-        clean_var = clean_tissue.var(dim=2, unbiased=False)
-        tissue_weight = tissue_mask[:, :, 0]
-        flat_loss = (clean_var * tissue_weight).sum() / tissue_weight.sum().clamp_min(1.0)
-
-        # 3. L_ortho (Deep aCompCor-style loss)
-        # Extract the average temporal noise summary from the WM+CSF volume
-        noise_summary = (noise_pred * tissue_mask).sum(dim=(3, 4, 5), keepdim=True) / (
-            tissue_mask.sum(dim=(3, 4, 5), keepdim=True).clamp_min(1.0)
-        )
-
-        # Squeeze spatial dimensions to get [B, C, T], then isolate the sequence [B, T]
-        noise_vector = noise_summary.squeeze(-1).squeeze(-1).squeeze(-1)[:, 0, :]
-
-        # Penalize correlation between GM signal and the global noise summary
-        clean_time_first = (clean_pred * gm_mask).permute(0, 1, 3, 4, 5, 2)
-        gm_voxels = clean_time_first.reshape(clean_pred.shape[0], -1, clean_pred.shape[2])
-        gm_voxels = gm_voxels - gm_voxels.mean(dim=-1, keepdim=True)
-        centered_noise = noise_vector - noise_vector.mean(dim=-1, keepdim=True)
-        gm_scores = torch.matmul(gm_voxels, centered_noise.unsqueeze(-1))
-        gm_count = gm_mask[:, :, 0].sum().clamp_min(1.0)
-        ortho_loss = gm_scores.pow(2).sum() / gm_count
-
-        # 4. Fast Fourier Transform Loss (Spectrum Matching)
-        # cuFFT does not support half-precision transforms for arbitrary lengths
-        # such as the default 40-frame window.
-        pred_fft = torch.fft.rfft(clean_pred.float() + noise_pred.float(), dim=2)
-        target_fft = torch.fft.rfft(target_bold.float(), dim=2)
-        fft_loss = F.mse_loss(torch.abs(pred_fft), torch.abs(target_fft))
-
-        total_loss = (
-            recon_loss 
-            + self.flat_weight * flat_loss 
-            + self.ortho_weight * ortho_loss 
-            + self.fft_weight * fft_loss
-        )
-
-        return total_loss, recon_loss, flat_loss, ortho_loss, fft_loss
-
-
-class fMRIMaskedLoss(nn.Module):
-    """Combines MAE token masking logic with the Structural Denoising Loss."""
-
-    def __init__(
-        self, 
-        patch_size: int = 14, 
-        fft_weight: float = 0.1, 
-        flat_weight: float = 1.0, 
-        ortho_weight: float = 1e-3, 
-        masked_loss_weight: float = 1.0,
-        full_loss_weight: float = 1.0,
-        merge_stages: int = 3
-    ) -> None:
-        """Initialize the loss wrapper."""
-        super().__init__()
-        self.patch_size = patch_size
-        self.masked_loss_weight = masked_loss_weight
-        self.full_loss_weight = full_loss_weight
-        self.flat_weight = flat_weight
-        self.ortho_weight = ortho_weight
-        self.fft_weight = fft_weight
-        self.grid_multiple = 2 ** merge_stages
-        self.structural_loss = StructuralDenoisingLoss(
-            patch_size=patch_size,
-            fft_weight=fft_weight,
-            flat_weight=flat_weight,
-            ortho_weight=ortho_weight,
-            merge_stages=merge_stages,
-        )
-
-        #self.fft_weight = fft_weight
-        #self.flat_weight = flat_weight
-        #self.ortho_weight = ortho_weight
-        
-        
-    def forward(
-        self, 
-        pred: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor], 
-        target: torch.Tensor, 
-        mask: torch.Tensor | None = None, 
-        clean_pred: torch.Tensor | None = None, 
-        noise_pred: torch.Tensor | None = None, 
-        gm_mask: torch.Tensor | None = None, 
-        wm_mask: torch.Tensor | None = None, 
-        csf_mask: torch.Tensor | None = None
+        self,
+        out: dict[str, torch.Tensor],
+        x: torch.Tensor,
+        tr: torch.Tensor | float = 1.0,
+        prior_scale: float = 1.0,
     ) -> dict[str, torch.Tensor]:
-        """Compute masked reconstruction and structural losses."""
-        if isinstance(pred, (tuple, list)):
-            total_pred, clean_pred, noise_pred = pred
-        else:
-            total_pred = pred
-            clean_pred = pred if clean_pred is None else clean_pred
-            noise_pred = torch.zeros_like(pred) if noise_pred is None else noise_pred
+        """Compute all loss terms.
 
-        # MAE Masked MSE: calculate reconstruction loss ONLY on the dropped tokens
-        if mask is not None and total_pred.shape[1] == 1:
-            B, C, T, X, Y, Z = total_pred.shape
-            P = self.patch_size
-            M = self.grid_multiple
+        Args:
+            out: Model output dict (``clean``, ``noise``, ``recon``, ``clean_pre``,
+                ``regressors``, ``voxel_mask``).
+            x: Input sample ``[B, 6, T, X, Y, Z]``.
+            tr: Repetition time(s) in seconds.
+            prior_scale: Multiplier in ``[0, 1]`` on the three prior terms (tissue, band,
+                ortho) for warm-up; ``rec`` is never scaled. ``1`` is the specified objective.
 
-            # Recalculate grid dimensions based on patch size and pooling stages
-            min_h = (X + P - 1) // P
-            min_w = (Y + P - 1) // P
-            min_d = (Z + P - 1) // P
+        Returns:
+            Dict with ``total``, ``rec``, ``tissue``, ``band``, ``ortho`` and detached
+            diagnostics (``clean_var_frac``, ``noise_var_frac``, ``resid_var_frac``: shares
+            of the target variance in masked GM voxels).
+        """
+        target = x[:, DYN : DYN + 1].float()
+        B, _, T = target.shape[:3]
+        brain = (x[:, BRAIN : BRAIN + 1, 0] > 0)  # [B,1,X,Y,Z]
+        gm = (x[:, GM : GM + 1, 0] > 0) & brain
+        wm = (x[:, WM : WM + 1, 0] > 0) & brain
+        csf = (x[:, CSF : CSF + 1, 0] > 0) & brain
 
-            Hp = ((min_h + M - 1) // M) * M
-            Wp = ((min_w + M - 1) // M) * M
-            Dp = ((min_d + M - 1) // M) * M
+        clean = out["clean"].float()
+        noise = out["noise"].float()
+        clean_pre = out["clean_pre"].float()
+        regressors = out["regressors"].float()  # [B,J,T]
 
-            # Reshape the 1D token mask back into the 4D voxel space
-            expected_tokens = T * Hp * Wp * Dp
-            if mask.shape[1] != expected_tokens:
-                raise ValueError(
-                    f"Mask has {mask.shape[1]} tokens, expected {expected_tokens} "
-                    f"for output shape {(T, X, Y, Z)} and patch size {P}."
-                )
-            mask_grid = rearrange(mask, 'b (t hp wp dp) -> b 1 t hp wp dp', t=T, hp=Hp, wp=Wp, dp=Dp)
-            voxel_mask = repeat(mask_grid, 'b 1 t hp wp dp -> b 1 t (hp p1) (wp p2) (dp p3)', p1=P, p2=P, p3=P)
-            voxel_mask = voxel_mask[:, :, :, :X, :Y, :Z]
+        # 1. Masked-token reconstruction (hidden voxels inside the brain only).
+        residual = target - clean - noise
+        hidden = (out["voxel_mask"] & brain).float().unsqueeze(2)  # [B,1,1,X,Y,Z]
+        rec = _masked_mean(residual.square(), hidden, T)
 
-            mse_loss = ((total_pred - target[:, :1]) ** 2) * voxel_mask
-            masked_mse = mse_loss.sum() / (voxel_mask.sum().clamp_min(1.0))
-        else:
-            masked_mse = F.mse_loss(total_pred, target[:, :1])
+        # 2. Clean suppression inside 1-voxel-eroded WM u CSF.
+        tissue_region = (
+            erode_mask(wm, self.erosion_iterations) | erode_mask(csf, self.erosion_iterations)
+        ).float().unsqueeze(2)
+        tissue = _masked_mean(clean_pre.square(), tissue_region, T)
 
-        structural_total, recon_loss, flat_loss, ortho_loss, fft_loss = self.structural_loss(
-            clean_pred=clean_pred,
-            noise_pred=noise_pred,
-            target=target,
-            gm_mask=gm_mask,
-            wm_mask=wm_mask,
-            csf_mask=csf_mask,
+        # 3. Out-of-band energy of the (pre-constraint) clean head in GM.
+        if isinstance(tr, torch.Tensor) and tr.ndim > 0 and tr.shape[0] != B:
+            raise ValueError("tr must be scalar or have one entry per sample.")
+        weights = band_weights(T, tr, self.band_low, self.band_high, device=target.device)
+        if weights.shape[0] == 1 and B > 1:
+            weights = weights.expand(B, -1)
+        out_of_band = clean_pre - apply_band(clean_pre, weights, time_dim=2)
+        gm_t = gm.float().unsqueeze(2)
+        band = _masked_mean(out_of_band.square(), gm_t, T)
+
+        # 4. Squared Pearson correlation between the final clean signal and every regressor.
+        centered = clean - clean.mean(dim=2, keepdim=True)  # [B,1,T,X,Y,Z]
+        r = regressors - regressors.mean(dim=-1, keepdim=True)
+        r = r / r.norm(dim=-1, keepdim=True).clamp_min(self.eps)  # unit-norm rows
+        dot = torch.einsum("bctxyz,bjt->bjxyz", centered, r)  # [B,J,X,Y,Z]
+        norm = centered.norm(dim=2).clamp_min(self.eps)  # [B,1,X,Y,Z]
+        rho_sq = (dot / norm).square()
+        active = (r.norm(dim=-1) > 0).float()[:, :, None, None, None]  # drop degenerate regressors
+        weight = gm.float() * active  # [B,J,X,Y,Z]
+        ortho = _masked_mean(rho_sq, weight)
+
+        total = self.rec_weight * rec + prior_scale * (
+            self.tissue_weight * tissue + self.band_weight * band + self.ortho_weight * ortho
         )
-        
-        total_loss = (
-            self.masked_loss_weight * masked_mse
-            + self.full_loss_weight * recon_loss
-            + self.flat_weight * flat_loss
-            + self.ortho_weight * ortho_loss
-            + self.fft_weight * fft_loss
-        )
+
+        with torch.no_grad():
+            region = (gm & out["voxel_mask"]).float().unsqueeze(2)
+            target_var = _masked_mean((target - target.mean(2, keepdim=True)).square(), region, T)
+
+            def share(signal: torch.Tensor) -> torch.Tensor:
+                centered_signal = signal - signal.mean(2, keepdim=True)
+                return _masked_mean(centered_signal.square(), region, T) / target_var.clamp_min(self.eps)
+
+            diagnostics = {
+                "clean_var_frac": share(clean),
+                "noise_var_frac": share(noise),
+                "resid_var_frac": share(residual),
+            }
+
         return {
-            "total": total_loss,
-            "masked_mse": masked_mse,
-            "reconstruction": recon_loss,
-            "flat": flat_loss,
-            "ortho": ortho_loss,
-            "fft": fft_loss,
-            "structural_total": structural_total,
+            "total": total,
+            "rec": rec,
+            "tissue": tissue,
+            "band": band,
+            "ortho": ortho,
+            **diagnostics,
         }

@@ -29,6 +29,7 @@ fi
 
 read -r -a TRAIN_SUBJECTS <<< "${TRAIN_SUBJECTS:-subj01 subj02 subj03 subj04 subj05 subj06}"
 read -r -a VALIDATION_SUBJECTS <<< "${VALIDATION_SUBJECTS:-subj07}"
+read -r -a TEST_SUBJECTS <<< "${TEST_SUBJECTS:-subj08}"
 if [[ ${#TRAIN_SUBJECTS[@]} -eq 0 || ${#VALIDATION_SUBJECTS[@]} -eq 0 ]]; then
     echo "Training and validation subject lists must both be non-empty." >&2
     exit 1
@@ -41,6 +42,12 @@ for validation_subject in "${VALIDATION_SUBJECTS[@]}"; do
     fi
 done
 
+for test_subject in "${TEST_SUBJECTS[@]}"; do
+    if [[ " ${TRAIN_SUBJECTS[*]} ${VALIDATION_SUBJECTS[*]} " == *" $test_subject "* ]]; then
+        echo "Subject $test_subject cannot be a test subject and also be used for training/validation." >&2
+        exit 1
+    fi
+done
 ALL_SUBJECTS=("${TRAIN_SUBJECTS[@]}" "${VALIDATION_SUBJECTS[@]}")
 DATA_SUBJECTS="${ALL_SUBJECTS[*]}"
 export DATA_SUBJECTS
@@ -79,10 +86,17 @@ groups = {(str(entry["subject"]), str(entry["run"])) for entry in dataset.entrie
 if len(groups) < 2:
     raise SystemExit(f"Need at least two subject/run groups; found {len(groups)}")
 
-sample = dataset[0]
+item = dataset[0]
+sample = item["x"]
+missing_brain = sum("brain_path" not in entry for entry in dataset.entries)
+if missing_brain:
+    print(
+        f"WARNING: {missing_brain} manifest entries have no brain_path (old preprocessing); "
+        "the brain mask is rebuilt on the fly. Re-run preprocessing to apply the label-77 fix."
+    )
 print(
     f"Subjects: {sorted(loaded)}; windows: {len(dataset)}; "
-    f"subject/run groups: {len(groups)}; sample shape: {tuple(sample.shape)}"
+    f"subject/run groups: {len(groups)}; sample shape: {tuple(sample.shape)}; TR={float(item['tr'])} s"
 )
 '
 
@@ -91,6 +105,21 @@ if [[ -n "${TRAIN_CROP_SIZE:-}" ]]; then
     CROP_ARGS=(--crop_size "$TRAIN_CROP_SIZE" "$TRAIN_CROP_SIZE" "$TRAIN_CROP_SIZE")
 fi
 
+TR_ARGS=()
+if [[ -n "${TRAIN_TR:-}" ]]; then
+    TR_ARGS=(--tr "$TRAIN_TR")
+fi
+ABLATION_ARGS=()
+if [[ "${TRAIN_FREE_NOISE_HEAD:-0}" == "1" ]]; then
+    ABLATION_ARGS+=(--free_noise_head)
+fi
+if [[ -n "${TRAIN_DECODER_SKIPS:-}" ]]; then
+    ABLATION_ARGS+=(--decoder_skips "$TRAIN_DECODER_SKIPS")
+fi
+SOFT_BANDPASS_ARGS=()
+if [[ "${TRAIN_SOFT_BANDPASS:-0}" == "1" ]]; then
+    SOFT_BANDPASS_ARGS=(--soft_bandpass)
+fi
 EARLY_STOPPING_ARGS=()
 if [[ -n "${TRAIN_EARLY_STOPPING_PATIENCE:-}" ]]; then
     EARLY_STOPPING_ARGS=(--early_stopping_patience "$TRAIN_EARLY_STOPPING_PATIENCE")
@@ -100,7 +129,7 @@ RUN_NAME="${TRAIN_WANDB_NAME:-nsd-full-40frame-${SLURM_JOB_ID:-run}}"
 
 echo "Training subjects: ${TRAIN_SUBJECTS[*]}"
 echo "Validation subjects: ${VALIDATION_SUBJECTS[*]}"
-echo "Held-out subjects not used in this run remain available for final evaluation."
+echo "Test subjects (evaluated after training, never used for selection): ${TEST_SUBJECTS[*]}"
 
 uv run --no-sync python -m src.train_nsd \
     --data_dir "$NSD_PROCESSED" \
@@ -118,11 +147,23 @@ uv run --no-sync python -m src.train_nsd \
     --embed_dim "${TRAIN_EMBED_DIM:-96}" \
     --mask_ratio "${TRAIN_MASK_RATIO:-0.75}" \
     --weight_decay "${TRAIN_WEIGHT_DECAY:-0.05}" \
-    --masked_loss_weight "${TRAIN_MASKED_LOSS_WEIGHT:-1.0}" \
-    --full_loss_weight "${TRAIN_FULL_LOSS_WEIGHT:-1.0}" \
-    --flat_loss_weight "${TRAIN_FLAT_LOSS_WEIGHT:-1.0}" \
-    --ortho_loss_weight "${TRAIN_ORTHO_LOSS_WEIGHT:-0.001}" \
-    --fft_loss_weight "${TRAIN_FFT_LOSS_WEIGHT:-0.1}" \
+    --rec_loss_weight "${TRAIN_REC_LOSS_WEIGHT:-1.0}" \
+    --tissue_loss_weight "${TRAIN_TISSUE_LOSS_WEIGHT:-1.0}" \
+    --band_loss_weight "${TRAIN_BAND_LOSS_WEIGHT:-1.0}" \
+    --ortho_loss_weight "${TRAIN_ORTHO_LOSS_WEIGHT:-0.1}" \
+    --n_comp "${TRAIN_N_COMP:-3}" \
+    --band_low "${TRAIN_BAND_LOW:-0.01}" \
+    --band_high "${TRAIN_BAND_HIGH:-0.15}" \
+    --erosion_iterations "${TRAIN_EROSION_ITERATIONS:-1}" \
+    --full_res_channels "${TRAIN_FULL_RES_CHANNELS:-24}" \
+    --detrend "${TRAIN_DETREND:-run}" \
+    --test_subjects "${TEST_SUBJECTS[@]}" \
+    --eval_K "${TRAIN_EVAL_K:-4}" \
+    --final_eval_windows_per_subject "${TRAIN_FINAL_EVAL_WINDOWS:-24}" \
+    "${TR_ARGS[@]}" \
+    "${SOFT_BANDPASS_ARGS[@]}" \
+    "${ABLATION_ARGS[@]}" \
+    --prior_warmup_steps "${TRAIN_PRIOR_WARMUP_STEPS:-0}" \
     "${CROP_ARGS[@]}" \
     "${EARLY_STOPPING_ARGS[@]}" \
     --checkpoint_dir "$RUN_DIR/checkpoints" \

@@ -168,7 +168,13 @@ class WindowAttention4D(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
-        mesh_args = torch.meshgrid.__kwdefaults__
+
+        # 4D relative position bias (translation-equivariant; replaces absolute embeddings).
+        # One learnable scalar per head for every relative offset in the nominal window.
+        table_len = int(np.prod([2 * w - 1 for w in window_size]))
+        self.relative_position_bias_table = nn.Parameter(torch.zeros(table_len, num_heads))
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
+        self._relative_index_cache: dict = {}
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -176,17 +182,44 @@ class WindowAttention4D(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask):
+    def _relative_position_index(self, window_size: Sequence[int], device: torch.device) -> torch.Tensor:
+        """Index ``[N, N]`` into the bias table for an (possibly clipped) window.
+
+        Windows are clipped to the feature size in the coarse stages, so the index is
+        built for the actual window and offset into the nominal-window table.
+        """
+        key = (tuple(int(w) for w in window_size), str(device))
+        cached = self._relative_index_cache.get(key)
+        if cached is not None:
+            return cached
+        coords = torch.stack(
+            torch.meshgrid(*[torch.arange(int(w), device=device) for w in window_size], indexing="ij")
+        ).flatten(1)  # [4, N]
+        relative = coords[:, :, None] - coords[:, None, :]  # [4, N, N]
+        nominal = [int(w) for w in self.window_size]
+        strides = [int(np.prod([2 * nominal[j] - 1 for j in range(i + 1, 4)])) for i in range(4)]
+        index = sum((relative[i] + (nominal[i] - 1)) * strides[i] for i in range(4))
+        self._relative_index_cache[key] = index
+        return index
+
+    def forward(self, x, mask, window_size: Optional[Sequence[int]] = None):
         """Forward function.
         Args:
             x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, N, N) or None
+            mask: additive mask with shape of (num_windows, N, N) or None. Combines the
+                shifted-window region mask and the key-padding mask (-100 = blocked).
+            window_size: actual window size (defaults to the nominal one).
         """
         b_, n, c = x.shape
         qkv = self.qkv(x).reshape(b_, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
+
+        index = self._relative_position_index(window_size or self.window_size, x.device)
+        bias = self.relative_position_bias_table[index.reshape(-1)].reshape(n, n, -1)
+        attn = attn + bias.permute(2, 0, 1).unsqueeze(0).to(attn.dtype)
+
         if mask is not None:
             nw = mask.shape[0]
             attn = attn.view(b_ // nw, nw, self.num_heads, n, n) + mask.to(attn.dtype).unsqueeze(1).unsqueeze(0)
@@ -284,7 +317,21 @@ class SwinTransformerBlock4D(nn.Module):
             shifted_x = x
             attn_mask = None
         x_windows = window_partition(shifted_x, window_size)
-        attn_windows = self.attn(x_windows, mask=attn_mask)
+
+        # Zero-padded tokens (grid rounded up to a window multiple) must not be attended to.
+        if pad_d1 > 0 or pad_h1 > 0 or pad_w1 > 0 or pad_t1 > 0:
+            real = x.new_zeros((1, dp, hp, wp, tp, 1))
+            real[:, :d, :h, :w, :t] = 1.0
+            if any(i > 0 for i in shift_size):
+                real = torch.roll(
+                    real, shifts=(-shift_size[0], -shift_size[1], -shift_size[2], -shift_size[3]), dims=(1, 2, 3, 4)
+                )
+            real_windows = window_partition(real, window_size).squeeze(-1)  # [nW, N]
+            key_mask = (1.0 - real_windows).unsqueeze(1) * -100.0  # [nW, 1, N]
+            key_mask = key_mask.expand(-1, real_windows.shape[1], -1)
+            attn_mask = key_mask if attn_mask is None else attn_mask + key_mask
+
+        attn_windows = self.attn(x_windows, mask=attn_mask, window_size=window_size)
         attn_windows = attn_windows.view(-1, *(window_size + (c,)))
         shifted_x = window_reverse(attn_windows, window_size, dims)
         if any(i > 0 for i in shift_size):

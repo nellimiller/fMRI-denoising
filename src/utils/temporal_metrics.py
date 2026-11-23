@@ -5,6 +5,11 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+try:
+    from .spectral import band_power_fraction
+except ImportError:
+    from utils.spectral import band_power_fraction
+
 
 def _static_mask(mask: Tensor, bold: Tensor, name: str) -> Tensor:
     if not torch.isfinite(mask).all():
@@ -162,3 +167,98 @@ def _temporal_correlations(left: Tensor, right: Tensor, eps: float) -> Tensor:
     centered_right = right - right.mean(dim=0, keepdim=True)
     denominator = centered_left.norm(dim=0) * centered_right.norm(dim=0)
     return (centered_left * centered_right).sum(dim=0) / denominator.clamp_min(eps)
+
+
+def _median_finite(values: Tensor) -> float | None:
+    values = values[torch.isfinite(values)]
+    return float(values.median().item()) if values.numel() else None
+
+
+def dynamic_metrics(
+    dyn: Tensor,
+    clean: Tensor,
+    noise: Tensor,
+    gm_mask: Tensor,
+    tr: float,
+    band: tuple[float, float] = (0.01, 0.15),
+    eps: float = 1e-8,
+) -> dict[str, float | None]:
+    """fMRI-specific diagnostics of a ``dyn = clean + noise + e`` decomposition inside GM.
+
+    All inputs live in percent-signal-change (PSC) space, so ``tSNR = 100 / SD_t`` for a
+    series whose baseline is 100 %. ``e`` is the residual ``dyn - clean - noise``.
+
+    Args:
+        dyn: Observed drift-removed PSC ``[T, X, Y, Z]``.
+        clean: Estimated clean BOLD ``[T, X, Y, Z]``.
+        noise: Estimated physiological component ``[T, X, Y, Z]``.
+        gm_mask: Static GM mask ``[X, Y, Z]``.
+        tr: Repetition time in seconds.
+        band: Hemodynamic pass band in Hz.
+
+    Returns:
+        Median per-voxel de-meaned Pearson correlations with the input, tSNR before and
+        after denoising (clean estimate; and input minus physiological component),
+        variance shares (their remainder ``cross_frac`` is the covariance between
+        components), fraction of non-DC power inside ``band`` per component, and the
+        held-out explained variance ``r2_gm``. tSNR gains are descriptive: removing
+        signal also raises tSNR.
+    """
+    if not (dyn.shape == clean.shape == noise.shape and dyn.ndim == 4):
+        raise ValueError("dyn, clean and noise must share the shape [T, X, Y, Z].")
+    gm = gm_mask > 0
+    if not bool(gm.any()):
+        raise ValueError("GM mask is empty.")
+
+    x = dyn[:, gm].float()
+    s = clean[:, gm].float()
+    n = noise[:, gm].float()
+    e = x - s - n
+
+    def correlation(a: Tensor, b: Tensor) -> Tensor:
+        a = a - a.mean(0, keepdim=True)
+        b = b - b.mean(0, keepdim=True)
+        denominator = a.norm(dim=0) * b.norm(dim=0)
+        return torch.where(
+            denominator > eps, (a * b).sum(0) / denominator.clamp_min(eps), torch.full_like(denominator, float("nan"))
+        )
+
+    def sd(a: Tensor) -> Tensor:
+        return a.std(dim=0, unbiased=False)
+
+    def tsnr(a: Tensor) -> Tensor:
+        deviation = sd(a)
+        return torch.where(deviation > eps, 100.0 / deviation.clamp_min(eps), torch.full_like(deviation, float("nan")))
+
+    tsnr_input = tsnr(x)
+    tsnr_clean = tsnr(s)
+    tsnr_phys_removed = tsnr(x - n)
+    total_var = x.var(dim=0, unbiased=False).sum().clamp_min(eps)
+    shares = {
+        "clean": s.var(dim=0, unbiased=False).sum() / total_var,
+        "noise": n.var(dim=0, unbiased=False).sum() / total_var,
+        "resid": e.var(dim=0, unbiased=False).sum() / total_var,
+    }
+    centred_x = x - x.mean(0, keepdim=True)
+    energy = centred_x.square().sum().clamp_min(eps)
+
+    metrics: dict[str, float | None] = {
+        "gm_corr_clean_input_median": _median_finite(correlation(s, x)),
+        "gm_corr_recon_input_median": _median_finite(correlation(s + n, x)),
+        "gm_corr_noise_input_median": _median_finite(correlation(n, x)),
+        "gm_tsnr_input_median": _median_finite(tsnr_input),
+        "gm_tsnr_clean_median": _median_finite(tsnr_clean),
+        "gm_tsnr_phys_removed_median": _median_finite(tsnr_phys_removed),
+        "gm_tsnr_gain_clean_median": _median_finite(tsnr_clean / tsnr_input),
+        "gm_tsnr_gain_phys_removed_median": _median_finite(tsnr_phys_removed / tsnr_input),
+        "var_clean_frac": float(shares["clean"]),
+        "var_noise_frac": float(shares["noise"]),
+        "var_resid_frac": float(shares["resid"]),
+        "var_cross_frac": float(1.0 - sum(shares.values())),
+        "r2_gm": float(1.0 - (e - e.mean(0, keepdim=True)).square().sum() / energy),
+    }
+    for name, series in (("input", x), ("clean", s), ("noise", n), ("resid", e)):
+        metrics[f"band_power_frac_{name}_median"] = _median_finite(
+            band_power_fraction(series, tr, band[0], band[1])
+        )
+    return metrics

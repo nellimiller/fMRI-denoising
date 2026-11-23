@@ -55,8 +55,8 @@ class RepeatedDataset(Dataset):
         """Return the fixed number of repeats."""
         return self.repeats
 
-    def __getitem__(self, index: int) -> torch.Tensor:
-        """Return the identical sample regardless of the index requested."""
+    def __getitem__(self, index: int):
+        """Return the identical sample (dict with ``x`` and ``tr``) regardless of the index."""
         return self.sample
 
 
@@ -127,7 +127,7 @@ def main() -> None:
 
     # Select one real temporal window, then repeat it deliberately for overfitting.
     one_sample = dataset[args.entry]
-    print(f"Test sample shape: {tuple(one_sample.shape)}")
+    print(f"Test sample shape: {tuple(one_sample['x'].shape)}")
 
     data = OverfitDataModule(
         dataset=RepeatedDataset(one_sample, 1),
@@ -137,7 +137,6 @@ def main() -> None:
     data.setup()
 
     model = fMRIDenoisingLightning(
-        in_chans=4,
         patch_size=args.patch_size,
         embed_dim=args.embed_dim,
         mask_ratio=args.mask_ratio,

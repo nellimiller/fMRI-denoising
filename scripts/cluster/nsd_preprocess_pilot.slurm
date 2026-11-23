@@ -40,6 +40,10 @@ if [[ -n "$existing_manifest" ]]; then
     exit 1
 fi
 
+TR_ARGS=()
+if [[ -n "${PILOT_TR:-}" ]]; then
+    TR_ARGS=(--tr "$PILOT_TR")
+fi
 mkdir -p "$NSD_PROCESSED"
 
 echo "Preprocessing subjects: ${SUBJECTS[*]}"
@@ -52,7 +56,8 @@ for subject in "${SUBJECTS[@]}"; do
         --output-root "$NSD_PROCESSED" \
         --subject "$subject" \
         --window-length "${PILOT_TIME_FRAMES:-8}" \
-        --stride "${PILOT_STRIDE:-10000}"
+        --stride "${PILOT_STRIDE:-10000}" \
+        "${TR_ARGS[@]}"
 done
 
 echo "Pilot preprocessing complete:"

@@ -222,4 +222,7 @@ notes.txt
 
 # Folder on Cluster
 runs/
-wandb/
+wandb/^
+
+# Documentation
+docs/

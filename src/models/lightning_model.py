@@ -9,36 +9,87 @@ import torch
 import torch.optim as optim
 
 try:
-    from ..utils.losses import fMRIMaskedLoss
+    from ..data.channels import NUM_CHANNELS
+    from ..utils.losses import IdentifiableDenoisingLoss
     from .mae_core import HierarchicalSwinMAE
 except ImportError:
+    from data.channels import NUM_CHANNELS
     from models.mae_core import HierarchicalSwinMAE
-    from utils.losses import fMRIMaskedLoss
+    from utils.losses import IdentifiableDenoisingLoss
+
+
+def split_weight_decay_groups(
+    model: torch.nn.Module, weight_decay: float
+) -> list[dict[str, Any]]:
+    """AdamW parameter groups: no decay for biases, norm layers, the mask token and
+    relative position bias tables (all 1-D parameters or explicitly named)."""
+    decay, no_decay = [], []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        excluded = (
+            parameter.ndim <= 1
+            or name.endswith(".bias")
+            or "mask_token" in name
+            or "relative_position_bias_table" in name
+            or "norm" in name.lower()
+        )
+        (no_decay if excluded else decay).append(parameter)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
 
 class fMRIDenoisingLightning(L.LightningModule):
-    """Lightning module coordinating the SwinMAE architecture and dual-engine loss.
+    """Lightning module coordinating the SwinMAE architecture and identifiable loss.
+
+    Batches are dicts ``{"x": [B, 6, T, X, Y, Z], "tr": [B], ...}`` as produced by
+    :class:`data.nsd_dataset.NSDDataset`.
 
     Args:
-        in_chans: Number of input channels (1 BOLD + 3 anatomical masks).
+        in_chans: Input channels (6: ``dyn, static_anat, gm, wm, csf, brain``).
         patch_size: Base spatial patch size for the encoder.
         embed_dim: Initial embedding dimension for the Swin blocks.
-        mask_ratio: Fraction of tokens to drop during training.
+        mask_ratio: Fraction of valid tubes hidden during training (``K = 1 / (1 - ratio)``
+            complementary passes reproduce it at inference; 0.75 <-> K = 4).
         lr: Maximum learning rate for the Cosine Annealing schedule.
-        weight_decay: L2 penalty factor for AdamW.
+        weight_decay: L2 penalty for AdamW (not applied to biases / norms / mask token /
+            relative position bias tables).
+        rec_loss_weight, tissue_loss_weight, band_loss_weight, ortho_loss_weight: Loss weights.
+        n_comp: aCompCor components in the nuisance basis.
+        band_low, band_high: Hemodynamic pass band in Hz.
+        erosion_iterations: Erosion of WM/CSF for regressors and the tissue penalty.
+        hard_bandpass: Gate and band-limit the clean head architecturally.
+        decoder_skips: ``"full"`` or ``"none"`` (ablation: bottleneck-only decoder).
+        free_noise_head: Ablation: free per-frame noise head instead of ``sum_j beta_j r_j``.
+        prior_warmup_steps: Linearly ramp the tissue / band / ortho terms from 0 to full
+            weight over this many optimiser steps (0 = off). All three priors are minimised by
+            an all-zero clean output, which can keep the clean head collapsed early in training.
+        validation_seed: Base seed for reproducible validation masks.
     """
+
     def __init__(
         self,
-        in_chans: int = 4,
+        in_chans: int = NUM_CHANNELS,
         patch_size: int = 14,
         embed_dim: int = 96,
         mask_ratio: float = 0.75,
         lr: float = 1.5e-4,
         weight_decay: float = 0.05,
-        masked_loss_weight: float = 1.0,
-        full_loss_weight: float = 1.0,
-        flat_loss_weight: float = 1.0,
-        ortho_loss_weight: float = 1e-3,
-        fft_loss_weight: float = 0.1,
+        rec_loss_weight: float = 1.0,
+        tissue_loss_weight: float = 1.0,
+        band_loss_weight: float = 1.0,
+        ortho_loss_weight: float = 0.1,
+        n_comp: int = 3,
+        band_low: float = 0.01,
+        band_high: float = 0.15,
+        erosion_iterations: int = 1,
+        hard_bandpass: bool = True,
+        full_res_channels: int = 24,
+        decoder_skips: str = "full",
+        free_noise_head: bool = False,
+        prior_warmup_steps: int = 0,
         validation_seed: int = 1234,
     ) -> None:
         """Initialize hyperparameters, core model, and loss function."""
@@ -49,93 +100,102 @@ class fMRIDenoisingLightning(L.LightningModule):
             patch_size=self.hparams.patch_size,
             in_chans=self.hparams.in_chans,
             embed_dim=self.hparams.embed_dim,
-            mask_ratio=self.hparams.mask_ratio
+            mask_ratio=self.hparams.mask_ratio,
+            n_comp=self.hparams.n_comp,
+            band_low=self.hparams.band_low,
+            band_high=self.hparams.band_high,
+            erosion_iterations=self.hparams.erosion_iterations,
+            hard_bandpass=self.hparams.hard_bandpass,
+            full_res_channels=self.hparams.full_res_channels,
+            decoder_skips=self.hparams.decoder_skips,
+            free_noise_head=self.hparams.free_noise_head,
         )
 
-        self.loss_fn = fMRIMaskedLoss(
-            patch_size=self.hparams.patch_size,
-            masked_loss_weight=self.hparams.masked_loss_weight,
-            full_loss_weight=self.hparams.full_loss_weight,
-            flat_weight=self.hparams.flat_loss_weight,
+        self.loss_fn = IdentifiableDenoisingLoss(
+            rec_weight=self.hparams.rec_loss_weight,
+            tissue_weight=self.hparams.tissue_loss_weight,
+            band_weight=self.hparams.band_loss_weight,
             ortho_weight=self.hparams.ortho_loss_weight,
-            fft_weight=self.hparams.fft_loss_weight,
+            erosion_iterations=self.hparams.erosion_iterations,
+            band_low=self.hparams.band_low,
+            band_high=self.hparams.band_high,
         )
 
     def forward(
-        self, x: torch.Tensor, tube_masking: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Execute the forward pass through the Masked Autoencoder.
+        self,
+        x: torch.Tensor,
+        tr: torch.Tensor | float = 1.0,
+        token_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Single masked forward pass (see :meth:`HierarchicalSwinMAE.forward`)."""
+        return self.model(x, tr, token_mask=token_mask)
 
-        Args:
-            x: Input 4D fMRI tensor '[B, C, T, X, Y, Z]'.
-            tube_masking: If True, drops identical spatial patches across all timeframes.
+    @torch.no_grad()
+    def denoise_complementary(
+        self,
+        x: torch.Tensor,
+        tr: torch.Tensor | float = 1.0,
+        K: int = 4,
+        generator: torch.Generator | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """J-invariant full-volume inference with K complementary tube masks."""
+        return self.model.denoise_complementary(x, tr, K=K, generator=generator)
 
-        Returns:
-            Tuple of '(reconstructed_total, clean_pred, noise_pred, binary_mask)'.
-        """
-        return self.model(x, tube_masking=tube_masking, return_heads=True)
+    @torch.no_grad()
+    def denoise_single(
+        self,
+        x: torch.Tensor,
+        tr: torch.Tensor | float = 1.0,
+        mask_ratio: float | None = None,
+        generator: torch.Generator | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Single-pass inference (ablation; not J-invariant). ``mask_ratio=0`` = unmasked."""
+        return self.model.denoise_single(x, tr, mask_ratio=mask_ratio, generator=generator)
 
-    def _shared_step(self, batch: torch.Tensor, phase: str) -> torch.Tensor:
-        """Handle forward pass, padding removal, and loss computation.
-        
-        Extracts redundant logic from both training and validation steps.
-        """
-        pred, clean_pred, noise_pred, mask = self(batch, tube_masking=True)
+    def _shared_step(self, batch: dict[str, Any], phase: str) -> torch.Tensor:
+        """Forward pass and loss computation shared by training and validation."""
+        x, tr = batch["x"], batch["tr"]
+        out = self(x, tr)
+        scale = 1.0
+        warmup = int(self.hparams.prior_warmup_steps)
+        if phase == "train" and warmup > 0:
+            scale = min(1.0, self.global_step / warmup)
+            self.log("prior_scale", scale, batch_size=x.shape[0])
+        losses = self.loss_fn(out, x, tr, prior_scale=scale)
 
-        # Dynamic cropping: Swin blocks often require spatial padding to divide evenly.
-        # Crops the predictions back to the original raw target shape before loss computation.
-        X, Y, Z = batch.shape[3], batch.shape[4], batch.shape[5]
-        
-        pred_cropped = pred[:, :, :, :X, :Y, :Z]
-        clean_cropped = clean_pred[:, :, :, :X, :Y, :Z]
-        noise_cropped = noise_pred[:, :, :, :X, :Y, :Z]
-
-        # Compute dual-engine loss using anatomical tissue priors (channels 1, 2, 3)
-        losses = self.loss_fn(
-            pred_cropped,
-            target=batch,
-            mask=mask,
-            clean_pred=clean_cropped,
-            noise_pred=noise_cropped,
-            gm_mask=batch[:, 1:2],
-            wm_mask=batch[:, 2:3],
-            csf_mask=batch[:, 3:4],
-        )
-
+        batch_size = x.shape[0]
         for name, value in losses.items():
-            self.log(f"{phase}_{name}", value, prog_bar=name == "total", sync_dist=True)
+            self.log(
+                f"{phase}_{name}",
+                value,
+                prog_bar=name == "total",
+                sync_dist=True,
+                batch_size=batch_size,
+            )
+        valid = out["valid"].float().sum().clamp_min(1.0)
         self.log(
-            f"{phase}_clean_energy",
-            clean_cropped.square().mean(),
+            f"{phase}_mask_fraction",
+            out["token_mask"].float().sum() / valid,
             sync_dist=True,
+            batch_size=batch_size,
         )
-        self.log(
-            f"{phase}_noise_energy",
-            noise_cropped.square().mean(),
-            sync_dist=True,
-        )
-        self.log(f"{phase}_mask_fraction", mask.float().mean(), sync_dist=True)
-
         return losses["total"]
 
-    def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         """Process a single training batch."""
         return self._shared_step(batch, phase="train")
 
-    def validation_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
-        """Process a single validation batch."""
+    def validation_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
+        """Process a single validation batch with a reproducible mask."""
+        x = batch["x"]
         seed = (
             int(self.hparams.validation_seed)
             + int(self.global_rank) * 1_000_003
             + batch_idx
         )
         devices = (
-            [
-                batch.device.index
-                if batch.device.index is not None
-                else torch.cuda.current_device()
-            ]
-            if batch.device.type == "cuda"
+            [x.device.index if x.device.index is not None else torch.cuda.current_device()]
+            if x.device.type == "cuda"
             else []
         )
         with torch.random.fork_rng(devices=devices):
@@ -143,29 +203,20 @@ class fMRIDenoisingLightning(L.LightningModule):
             if devices:
                 torch.cuda.manual_seed(seed)
             return self._shared_step(batch, phase="val")
-    
+
     def configure_optimizers(self) -> dict[str, Any]:
-        """Configure the AdamW optimizer and Cosine Annealing schedule."""
-        # AdamW with high weight decay is the industry standard for Vision Transformers
+        """Configure AdamW (selective weight decay) and a cosine annealing schedule."""
         optimizer = optim.AdamW(
-            self.parameters(),
+            split_weight_decay_groups(self, self.hparams.weight_decay),
             lr=self.hparams.lr,
-            weight_decay=self.hparams.weight_decay,
             betas=(0.9, 0.95),
         )
-        
-        # Transformers are notoriously unstable during early training.
-        # Cosine annealing lowers the LR to settle into deep minimums.
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, 
-            T_max=self.trainer.max_epochs if self.trainer.max_epochs else 100, 
+            optimizer,
+            T_max=self.trainer.max_epochs if self.trainer.max_epochs else 100,
             eta_min=1e-6,
         )
-        
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-            },
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
         }

@@ -86,10 +86,11 @@ if len(groups) < 2:
     raise SystemExit(
         f"Need at least two subject/run groups for train/validation; found {len(groups)}."
     )
-sample = dataset[0]
+item = dataset[0]
+sample = item["x"]
 print(
     f"Subjects: {sorted(loaded_subjects)}; windows: {len(dataset)}; "
-    f"groups: {len(groups)}; sample: {tuple(sample.shape)}"
+    f"groups: {len(groups)}; sample: {tuple(sample.shape)}; TR={float(item['tr'])} s"
 )
 '
 
@@ -105,6 +106,10 @@ uv run --no-sync python -m src.train_nsd \
     --crop_size "${PILOT_CROP_SIZE:-32}" "${PILOT_CROP_SIZE:-32}" "${PILOT_CROP_SIZE:-32}" \
     --patch_size "${PILOT_PATCH_SIZE:-4}" \
     --embed_dim "${PILOT_EMBED_DIM:-24}" \
+    --full_res_channels "${PILOT_FULL_RES_CHANNELS:-8}" \
+    --n_comp "${PILOT_N_COMP:-2}" \
+    --detrend "${PILOT_DETREND:-run}" \
+    --skip_final_eval \
     --checkpoint_dir "$RUN_DIR/checkpoints" \
     --log_dir "$RUN_DIR/logs" \
     --visualization_dir "$RUN_DIR/visualizations" \

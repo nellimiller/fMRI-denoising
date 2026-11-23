@@ -15,6 +15,7 @@ dependencies = [
     "nipype>=1.11.0",
     "numpy>=2.4.6",
     "pytorch-lightning>=2.6.5",
+    "scipy>=1.14.0",
     "torch>=2.6.0",
     "torchmetrics>=1.9.0",
     "wandb>=0.27.0",

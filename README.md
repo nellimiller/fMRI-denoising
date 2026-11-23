@@ -7,19 +7,31 @@ Natural Scenes Dataset (NSD) functional runs and uses anatomical grey matter
 
 ## Status and interpretation
 
-The model reconstructs the observed BOLD signal as the sum of two learned
-outputs:
+The model works in percent-signal-change (PSC) space inside a parenchymal brain
+mask and decomposes the drift-removed signal as
 
 ```text
-reconstruction = clean_head + noise_head
+X~(v,t) = S_clean(v,t) + N_phys(v,t) + e(v,t)
+S_clean = soft-GM gate * bandpass(clean head)            # 0.01-0.15 Hz
+N_phys  = sum_j beta_j(v) r_j(t)                         # static maps x nuisance regressors
+r_j     = eroded-WM mean, eroded-CSF mean, top aCompCor PCs of *visible* eroded WM/CSF voxels
 ```
 
-Training uses masked reconstruction together with full reconstruction,
-tissue-based regularizers, and a temporal FFT term. There is no clean fMRI
-target in this workflow. Consequently, reconstruction and anatomical priors
-alone do not uniquely identify the clean and noise components. Treat the
-separation as an experimental hypothesis, not validated denoising; inspect
-the component metrics and visualizations before drawing conclusions.
+Input is a 6-channel tensor `[dyn, static_anat, gm, wm, csf, brain]`; only `dyn`
+is masked (tube masking over valid brain cells), the anatomy is always visible
+and a U-Net decoder carries it to voxel resolution. Training minimises a masked
+reconstruction loss plus tissue, band and orthogonality priors; inference uses
+J-invariant complementary K-pass masking (K = 4). There is still no clean fMRI
+target, so the decomposition rests on the stated priors and is an experimental
+hypothesis, not validated denoising. The full derivation, the diagnosis of the
+previous baseline and an ablation matrix are in
+[`docs/THESIS_METHODOLOGY_AND_CHANGES.md`](docs/THESIS_METHODOLOGY_AND_CHANGES.md)
+(LaTeX version: `docs/thesis_remediation_section.tex`).
+
+> **Re-run preprocessing.** Manifests now carry `brain_path`, `tr`, and corrected
+> tissue labels (label 77 moved from GM to WM). Old manifests still load (the brain
+> mask is rebuilt on the fly) but keep the old labels. Checkpoints from the previous
+> architecture are incompatible.
 
 ## Region-guided projection baseline
 
@@ -33,12 +45,12 @@ noise.
 ```python
 from utils.region_guided import region_guided_projection
 
-# batch has shape [B, 4, T, X, Y, Z]: BOLD, GM, WM, CSF
+# x has shape [B, 6, T, X, Y, Z]: dyn, static_anat, GM, WM, CSF, brain
 result = region_guided_projection(
-    batch[:, 0],
-    batch[:, 1],
-    batch[:, 2],
-    batch[:, 3],
+    x[:, 0],
+    x[:, 2, 0],
+    x[:, 3, 0],
+    x[:, 4, 0],
 )
 clean_bold = result.clean
 removed_component = result.noise
@@ -60,7 +72,11 @@ assumption must be checked against task-related responses. Estimate traces
 over full runs where possible: fitting them independently in short,
 overlapping windows can make the removed signal change at window boundaries.
 
-### What the first evaluation showed
+### What the first (pre-remediation) evaluation showed
+
+This section describes the original architecture/objective that the remediation
+replaces; see the methodology document for why those numbers mostly measure static
+anatomy (99.95 % of the z-scored variance) rather than denoising.
 
 The supplied evaluation tested `subj08` across 12 runs and 168 forty-frame
 windows, using one mask draw per window. The reported sum reconstruction had
@@ -162,8 +178,14 @@ Useful options include:
 | `--patch_size` / `--embed_dim` | Model capacity; defaults are `14` / `96`. |
 | `--mask_ratio` | Fraction of spatial tube tokens masked; default `0.75`. |
 | `--weight_decay` | AdamW weight decay; default `0.05`. |
-| `--masked_loss_weight` / `--full_loss_weight` | Masked and full reconstruction weights; both default `1.0`. |
-| `--flat_loss_weight` / `--ortho_loss_weight` / `--fft_loss_weight` | Tissue and spectrum loss weights; defaults `1.0`, `0.001`, `0.1`. |
+| `--rec_loss_weight` / `--tissue_loss_weight` / `--band_loss_weight` / `--ortho_loss_weight` | Identifiable-loss weights; defaults `1.0`, `1.0`, `1.0`, `0.1`. |
+| `--n_comp` / `--erosion_iterations` | aCompCor components (default `3`) and WM/CSF erosion (default `1`). |
+| `--band_low` / `--band_high` | Hemodynamic pass band in Hz (`0.01`-`0.15`). |
+| `--soft_bandpass` | Ablation: no architectural GM gate / bandpass on the clean head. |
+| `--decoder_skips none` / `--free_noise_head` | Ablations: bottleneck-only decoder; free per-frame noise head instead of the regressor-subspace head. |
+| `--prior_warmup_steps` | Ramp tissue/band/ortho terms from 0 over N steps (default off; did not prevent clean-head collapse in a 200-step test, see the methodology document). |
+| `--detrend` / `--tr` | Detrending mode (`run`, `window`, `run+window`, `none`) and TR override in seconds. |
+| `--test_subjects` / `--eval_K` | Held-out subjects evaluated after training with K-pass inference (default `K=4`). |
 | `--early_stopping_patience` | Stop after this many non-improving validation epochs; `0` disables it. |
 | `--precision` | Lightning precision mode; use `32-true` for a conservative smoke run. |
 | `--gradient_clip_val` | Clip gradient norm (default `1.0`). |
@@ -225,14 +247,15 @@ more memory than this diagnostic.
 
 ## Monitoring outputs
 
-The trainer logs total loss and its masked reconstruction, full reconstruction,
-flatness, orthogonality, and FFT components. It also logs clean/noise output
-energy and the masked-token fraction. Checkpoints are written to
+The trainer logs the total loss and its `rec`, `tissue`, `band` and `ortho`
+components, the shares of masked-GM variance carried by the clean, noise and
+residual components (`*_var_frac`), and the masked-token fraction. A resolved
+`hparams.json` is written next to the checkpoints. Checkpoints are written to
 `checkpoints_nsd/` by default. A validation slice panel for a fixed sample is
 saved to `validation_visualizations/` after each validation epoch; the
 training mask is randomized, while validation uses a fixed mask per batch so
 validation curves are comparable across epochs.
-The FFT component is calculated in float32 so mixed-precision training supports
+The bandpass operator runs its FFTs in float32 so mixed-precision training supports
 the default 40-frame sequence length on CUDA.
 
 The trainer always keeps the best `val_total` checkpoint. Optional early
@@ -323,48 +346,43 @@ with aligned held-out GLM responses or repeat reliability.
 
 ### Run held-out evaluation on Slurm
 
-After training, choose a best-validation checkpoint and a test subject that
-was not used for training or validation. From the repository root, set the
-processed-data path, checkpoint, and persistent output directory, then submit
-the evaluation job. The defaults evaluate `subj08` with 40-frame windows:
+After training, choose a best-validation checkpoint. `train_nsd.py` already evaluates
+it on the validation and `--test_subjects` at the end of the run
+(`<checkpoint_dir>/final_evaluation/`); the job below repeats that evaluation on any
+checkpoint and subjects. From the repository root:
 
 ```bash
 export NSD_PROCESSED=/path/to/nsd_processed_40f_s20
 export CHECKPOINT=/path/to/run/checkpoints/best-validation-checkpoint.ckpt
 export EVAL_DIR=/path/to/persistent/evaluations/nsd_test
-export EVAL_SUBJECTS=subj08
-export EVAL_TRAIN_VISUAL_SUBJECTS=subj01
-export EVAL_VALIDATION_VISUAL_SUBJECTS=subj07
+export EVAL_SUBJECTS=subj08              # test subjects (metrics + figures)
+export EVAL_VALIDATION_SUBJECTS=subj07   # validation subjects (metrics + figures)
+export EVAL_TRAIN_VISUAL_SUBJECTS=subj01 # training subjects (figures only)
 
 sbatch scripts/cluster/nsd_evaluate.slurm
 ```
 
-The evaluator loads model hyperparameters from the Lightning checkpoint and
-writes `metrics_by_window.csv`, `metrics_by_run.csv`,
-`metrics_by_subject.csv`, and `summary.json` to `EVAL_DIR`. It also saves up
-to three example slice panels per subject under
-`EVAL_DIR/visualizations/{train,validation,test}/`. `EVAL_SUBJECTS` are the
-test subjects included in the quantitative metrics. Optional
-`EVAL_TRAIN_VISUAL_SUBJECTS` and `EVAL_VALIDATION_VISUAL_SUBJECTS` add
-training/validation subjects for visual comparison only; they are excluded
-from the metric CSVs. Each panel shows observed BOLD, the predicted clean
-head, reconstruction, noise head, reconstruction residual, and GM/WM/CSF
-masks. Input, clean, and reconstruction panels use the same intensity scale.
-The predicted clean head is an experimental output, not a validated
-clean-signal estimate. Examples are selected across each subject's windows
-and show the middle time point on the axial slice with the most tissue-mask
-voxels.
+Every window of every split is denoised with the same J-invariant complementary
+K-pass inference (`EVAL_K`, default 4: the four visible sets partition the valid
+brain tubes, each pass hides 75 %, and a voxel is averaged only over the three passes
+in which it was hidden). The evaluator writes `metrics_by_window.csv`,
+`metrics_by_run.csv`, `metrics_by_subject.csv` and `summary.json` (with a `split`
+column / per-split means) and up to `EVAL_VISUAL_EXAMPLES_PER_SUBJECT` panels per
+subject under `EVAL_DIR/visualizations/{train,validation,test}/`. Each panel shows the
+static anatomy, observed PSC, the clean estimate, the physiological component, the
+residual, the tissue labels, a median-variance GM voxel trace and the GM power spectrum.
 
-Metrics include full and masked MSE/MAE/RMSE and correlation, tissue-specific
-MSE, and clean and noise output energy. The run and subject summaries average
-windows and runs respectively; the overall summary averages subjects equally.
-Use `EVAL_TIME_FRAMES` and optional `EVAL_CROP_SIZE="X Y Z"` to match the
-preprocessed windows and training crop, `EVAL_MASK_REPEATS` to average
-different deterministic tube-mask draws, `EVAL_SEED` to choose their
-reproducible seed, and `EVAL_VISUAL_EXAMPLES_PER_SUBJECT` to change the number
-of panels (set it to `0` to disable). These remain
-reconstruction/consistency metrics against observed BOLD, not measures of
-clean-signal recovery.
+Metrics (descriptive; there is no clean-fMRI ground truth): held-out `r2_brain`/`r2_gm`
+and `mse_brain`; de-meaned GM temporal correlation of the clean / reconstructed /
+noise component with the input; GM tSNR before and after (clean estimate, and input minus
+the physiological component); the variance shares of clean, noise and residual (with
+`var_cross_frac` the covariance remainder); and the fraction of non-DC power inside
+0.01-0.15 Hz for each component. A tSNR gain is also obtained by removing genuine signal,
+so read it together with `var_clean_frac` and the correlation. Use `EVAL_TIME_FRAMES` and
+optional `EVAL_CROP_SIZE="X Y Z"` to match the preprocessed windows and training crop,
+`EVAL_MASK_REPEATS` to average independent K-partitions, `EVAL_MAX_WINDOWS_PER_SUBJECT`
+to subsample, `EVAL_DETREND` / `EVAL_TR` to match training, and `EVAL_SEED` for
+reproducibility.
 
 Before a longer run, check that:
 
@@ -637,8 +655,11 @@ Run the automated tests with:
 uv run pytest
 ```
 
-They include a small synthetic CPU training smoke test. This verifies basic
-execution and gradient flow, not scientific denoising quality.
+They include a synthetic CPU training smoke test, exact J-invariance tests of the
+K-pass inference, and end-to-end runs of the training driver and both evaluation
+scripts on synthetic NIfTI data. This verifies execution, gradient flow and
+leakage-freedom, not scientific denoising quality. For a real-data check on one
+subject run `tools/verify_pipeline_subj01.py` (see its docstring).
 
 For a data-backed one-window overfit diagnostic, see
 [the NSD preprocessing guide](src/data_preprocessing/nsd/README.md). It
@@ -650,24 +671,31 @@ experiment.
 ```text
 src/
 ├── data/
-│   ├── nsd_dataset.py              # Manifest-backed NSD loader
+│   ├── brain_mask.py               # Parenchymal brain mask (closing, largest CC, hole fill)
+│   ├── channels.py                 # 6-channel layout constants
+│   ├── nsd_dataset.py              # Manifest-backed loader: PSC target + static anatomy
 │   └── synthetic.py                # Synthetic data for smoke tests
 ├── data_preprocessing/nsd/
 │   └── preprocess.py               # NSD masks and temporal manifests
 ├── evaluate_temporal.py            # Temporal comparison of model and projection outputs
 ├── models/
-│   ├── mae_core.py                 # Masked hierarchical Swin encoder
-│   ├── decoder.py                  # Additive clean/noise output heads
-│   └── lightning_model.py          # Training steps, metrics, optimizer
+│   ├── mae_core.py                 # Swin encoder, regressors, gated/band-limited clean head, K-pass wrapper
+│   ├── decoder.py                  # U-Net decoder with skips + asymmetric heads
+│   ├── patch_embed.py              # Dynamic (maskable) and anatomy (always visible) embeddings
+│   └── lightning_model.py          # Training steps, metrics, selective weight decay
 ├── utils/
-│   ├── losses.py                   # Reconstruction and structural losses
-│   ├── masking.py                  # Token masking
+│   ├── losses.py                   # Identifiable objective (rec, tissue, band, ortho)
+│   ├── masking.py                  # Valid-cell tube masks, complementary K-pass inference
 │   ├── region_guided.py            # Explicit WM/CSF nuisance projection baseline
-│   ├── temporal_metrics.py         # Temporal signal diagnostics
+│   ├── spectral.py                 # Differentiable bandpass and band-power diagnostics
+│   ├── temporal_metrics.py         # Temporal + dynamic (tSNR, variance shares) diagnostics
+│   ├── tissue.py                   # Erosion, soft GM support, visible-voxel regressors
 │   ├── visualization.py            # Validation slice panels
 │   └── train_nsd_overfit.py        # Single-window diagnostic
 ├── train_nsd.py                    # Canonical NSD training entry point
 └── test_pipeline.py                # Manual synthetic forward/backward check
+tools/verify_pipeline_subj01.py     # End-to-end real-data verification (phases 1-4)
+docs/                               # Thesis methodology (Markdown + LaTeX)
 ```
 
 The matching Slurm entry point for temporal diagnostics is

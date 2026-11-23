@@ -1,12 +1,73 @@
-"""Token masking logic for the Masked Autoencoder.
+"""Token masking and complementary K-pass inference for the Masked Autoencoder.
 
-Generates random probabilistic masks and overwrites dropped tokens 
-with a learnable placeholder while maintaining sequence length.
+Training draws one random *tube* mask per sample: all ``T`` frames of a chosen
+spatial patch are hidden together, over *valid* cells only (cells containing at
+least one brain voxel; pure padding cells are never counted). The number of masked
+cells is fixed, ``round(ratio * n_valid)``.
+
+Inference uses ``K`` complementary masks whose *visible* sets partition the valid
+cells, so every hidden-ratio equals ``(K - 1) / K`` (0.75 for ``K = 4``), and each
+voxel is hidden in exactly ``K - 1`` passes. Averaging only those passes gives a
+J-invariant estimate: a voxel's own measurements never enter its prediction.
 """
 
 from __future__ import annotations
 
+from typing import Callable, Mapping, Sequence
+
 import torch
+
+
+def sample_tube_mask(
+    valid: torch.Tensor,
+    mask_ratio: float,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample a fixed-count spatial tube mask over valid cells.
+
+    Args:
+        valid: Bool ``(B, S)``; cells that may be masked.
+        mask_ratio: Fraction of *valid* cells to hide.
+        generator: Optional RNG for reproducible draws.
+
+    Returns:
+        Bool ``(B, S)``, ``True`` = hidden. Invalid cells are always ``False``.
+    """
+    if not 0.0 <= mask_ratio <= 1.0:
+        raise ValueError("mask_ratio must be in [0, 1].")
+    B, S = valid.shape
+    scores = torch.rand(B, S, generator=generator, device=valid.device)
+    scores = scores.masked_fill(~valid, 2.0)  # invalid cells sort last
+    rank = scores.argsort(dim=1).argsort(dim=1)
+    n_mask = torch.round(valid.sum(dim=1, keepdim=True).float() * mask_ratio).long()
+    return (rank < n_mask) & valid
+
+
+def complementary_tube_masks(
+    B: int,
+    S: int,
+    K: int = 4,
+    valid: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Build ``K`` complementary tube masks.
+
+    The visible sets are a disjoint, balanced partition of the valid cells.
+
+    Returns:
+        Bool ``(K, B, S)``; ``masks[k]`` is ``True`` where the tube is HIDDEN in
+        pass ``k``. Invalid cells are never hidden (``False``).
+    """
+    if K < 2:
+        raise ValueError("K must be >= 2.")
+    if valid is None:
+        valid = torch.ones(B, S, dtype=torch.bool, device=device)
+    scores = torch.rand(B, S, generator=generator, device=valid.device)
+    scores = scores.masked_fill(~valid, 2.0)
+    group = scores.argsort(dim=1).argsort(dim=1) % K  # balanced group id per cell
+    visible = torch.stack([(group == k) & valid for k in range(K)])
+    return (~visible) & valid.unsqueeze(0)
 
 
 def apply_swin_mask(
@@ -15,54 +76,103 @@ def apply_swin_mask(
     mask_ratio: float = 0.75,
     tube_masking: bool = False,
     T: int | None = None,
+    valid: torch.Tensor | None = None,
+    token_mask: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Replace a percentage of tokens with a learnable MASK token.
-
-    Maintains exact sequence length to allow reshaping back into the 4D spatial-temporal grid.
+    """Replace masked tokens with a learnable MASK token (sequence length is preserved).
 
     Args:
-        x: Tensor of embedded tokens `[Batch, Sequence_Length, Embed_Dim]`.
-        mask_token: Learnable parameter `[1, 1, Embed_Dim]`.
-        mask_ratio: Fraction of tokens to mask out.
-        tube_masking: If True, drops the exact same spatial patches across all timeframes.
-        T: Number of timeframes. Required if `tube_masking` is True.
+        x: Embedded dynamic tokens ``(B, L, E)`` ordered ``(t, spatial)``.
+        mask_token: Learnable parameter ``(1, 1, E)``.
+        mask_ratio: Fraction of valid cells (tube) or tokens to mask.
+        tube_masking: Hide identical spatial cells across all frames.
+        T: Number of frames (required for tube masking / ``token_mask``).
+        valid: Bool ``(B, S)`` of maskable spatial cells (tube masking only).
+        token_mask: Optional explicit spatial mask ``(B, S)`` bool; overrides sampling.
+        generator: Optional RNG.
 
     Returns:
-        A tuple containing:
-        - x_masked: Full-length sequence with masked tokens replaced.
-        - mask: Binary mask indicating which tokens were dropped (1=masked, 0=unmasked).
+        ``(x_masked, mask)`` with ``mask`` float ``(B, L)``, 1 = masked.
     """
-    B, L, D = x.shape
+    B, L, E = x.shape
 
-    if tube_masking:
+    if token_mask is not None or tube_masking:
         if T is None:
             raise ValueError("T (number of timepoints) must be provided for tube masking.")
-        
-        # Calculate how many spatial tokens per timepoint
         S = L // T
-
-        # Generate random noise ONLY for spatial grid [Batch, Spatial_Patches]
-        noise_spatial = torch.rand(B, S, device=x.device)
-
-        # Repreat noise across temporal dimension to create a continuoustube mask
-        # Shape: [Batch, Time, Spatial_Patches]
-        noise = noise_spatial.unsqueeze(1).repeat(1, T, 1)
-
-        # Flatten it back into the 1D token sequence [Batch, Sequence_Length]
-        noise = noise.view(B, L)
-
+        if token_mask is None:
+            if valid is None:
+                valid = torch.ones(B, S, dtype=torch.bool, device=x.device)
+            token_mask = sample_tube_mask(valid, mask_ratio, generator)
+        elif token_mask.shape != (B, S):
+            raise ValueError(f"token_mask must have shape {(B, S)}, got {tuple(token_mask.shape)}.")
+        mask = token_mask.bool().unsqueeze(1).expand(B, T, S).reshape(B, L).float()
     else:
-        # Unstructured random masking: Generate noise for each token independently
-        noise = torch.rand(B, L, device=x.device)
+        noise = torch.rand(B, L, generator=generator, device=x.device)
+        mask = (noise < mask_ratio).float()
 
-   
-    # Create binary mask (1= masked, 0=unmasked) based on noise and mask ratio
-    mask = (noise < mask_ratio).float() 
-
-    # Expand mask to match token embedding dimension
-    mask_expanded = mask.unsqueeze(-1).expand(-1, -1, D)
-
-    # Apply mask: keep original tokens where mask is 0, insert mask_token where mask is 1
-    x_masked = x * (1 - mask_expanded) + mask_expanded * mask_token
-
+    m = mask.unsqueeze(-1)
+    x_masked = x * (1 - m) + m * mask_token.to(x.dtype)
     return x_masked, mask
+
+
+def token_mask_to_voxel_mask(
+    spatial_mask: torch.Tensor,
+    grid: tuple[int, int, int],
+    patch_size: int,
+    shape: tuple[int, int, int],
+) -> torch.Tensor:
+    """Expand a spatial tube mask ``(B, S)`` to voxels ``(B, 1, X, Y, Z)`` (cropped to ``shape``)."""
+    B = spatial_mask.shape[0]
+    m = spatial_mask.reshape(B, 1, *grid)
+    for axis in (2, 3, 4):
+        m = m.repeat_interleave(patch_size, dim=axis)
+    X, Y, Z = shape
+    return m[:, :, :X, :Y, :Z]
+
+
+@torch.no_grad()
+def denoise_complementary(
+    forward_fn: Callable[[torch.Tensor], Mapping[str, torch.Tensor]],
+    valid: torch.Tensor,
+    grid: tuple[int, int, int],
+    patch_size: int,
+    shape: tuple[int, int, int],
+    K: int = 4,
+    generator: torch.Generator | None = None,
+    keys: Sequence[str] = ("clean", "noise"),
+) -> dict[str, torch.Tensor]:
+    """J-invariant full-volume inference with ``K`` complementary tube masks.
+
+    Args:
+        forward_fn: Runs the model with a spatial token mask ``(B, S)`` (``True`` =
+            hidden) and returns tensors ``(B, 1, T, X, Y, Z)`` for every name in ``keys``.
+        valid: Bool ``(B, S)`` of valid spatial cells.
+        grid: Patch grid ``(H_p, W_p, D_p)``.
+        patch_size: Patch edge length in voxels.
+        shape: Output spatial shape ``(X, Y, Z)``.
+        K: Number of passes; the training hidden ratio is ``(K - 1) / K``.
+        generator: Optional RNG for the partition.
+        keys: Output tensors to average.
+
+    Returns:
+        ``{key: tensor}`` averaged over the ``K - 1`` passes in which each voxel was
+        hidden, plus ``"count"`` ``(B, 1, 1, X, Y, Z)`` = passes averaged per voxel
+        (``K - 1`` inside valid cells, ``0`` elsewhere).
+    """
+    B, S = valid.shape
+    masks = complementary_tube_masks(B, S, K, valid, generator, device=valid.device)
+    totals: dict[str, torch.Tensor] = {}
+    count: torch.Tensor | None = None
+    for k in range(K):
+        outputs = forward_fn(masks[k])
+        weight = token_mask_to_voxel_mask(masks[k], grid, patch_size, shape).float().unsqueeze(2)
+        for key in keys:
+            value = outputs[key].float() * weight
+            totals[key] = value if key not in totals else totals[key] + value
+        count = weight if count is None else count + weight
+    assert count is not None
+    result = {key: total / count.clamp_min(1.0) for key, total in totals.items()}
+    result["count"] = count
+    return result

@@ -1,20 +1,23 @@
-"""Smoke tests and CI verificatons for the fMRI denoising pipeline."""
+"""Smoke tests and CI verifications for the fMRI denoising pipeline."""
 
 from __future__ import annotations
 
+import json
+
 import lightning as L
+import pytest
 import torch
 from torch.utils.data import DataLoader, random_split
 
+from data.channels import BRAIN, DYN, NUM_CHANNELS
 from data.synthetic import SyntheticNSDDataset
-from models.lightning_model import fMRIDenoisingLightning
-from train_nsd import NSDDataModule
-from utils.losses import StructuralDenoisingLoss
+from models.lightning_model import fMRIDenoisingLightning, split_weight_decay_groups
+from train_nsd import NSDDataModule, parse_args, validate_args, write_hparams
 from utils.visualization import crop_to_input
 
 
 def test_visualization_crops_padded_predictions() -> None:
-    sample = torch.zeros(4, 8, 30, 27, 19)
+    sample = torch.zeros(6, 8, 30, 27, 19)
     padded_prediction = torch.ones(1, 1, 8, 32, 32, 24)
 
     cropped = crop_to_input(padded_prediction, sample)
@@ -23,91 +26,44 @@ def test_visualization_crops_padded_predictions() -> None:
     assert torch.equal(cropped, torch.ones_like(cropped))
 
 
-def test_synthetic_dataset_shape() -> None:
-    """Verify the synthetic dataset generates correct 5D tensor shapes."""
+def test_synthetic_dataset_matches_real_sample_contract() -> None:
     ds = SyntheticNSDDataset(n_subjects=2, time_frames=8, shape=(16, 16, 8), seed=1)
 
     assert len(ds) == 2
-
     item = ds[0]
-    assert isinstance(item, torch.Tensor)
-
-    # Expected shape: [Channels (BOLD+GM+WM+CSF), Time, X, Y, Z]
-    assert item.shape == (4, 8, 16, 16, 8)
-
-
-def test_structural_loss_fft_supports_half_precision_40_frames() -> None:
-    clean = torch.randn(1, 1, 40, 2, 2, 2, dtype=torch.float16, requires_grad=True)
-    noise = torch.randn_like(clean, requires_grad=True)
-    target_bold = torch.randn_like(clean)
-    gm = torch.ones_like(clean)
-    wm = torch.zeros_like(clean)
-    csf = torch.zeros_like(clean)
-    target = torch.cat((target_bold, gm, wm, csf), dim=1)
-
-    total, _, _, _, fft = StructuralDenoisingLoss()(clean, noise, target)
-
-    assert total.dtype == torch.float32
-    assert torch.isfinite(total)
-    assert torch.isfinite(fft)
-    total.backward()
-    assert clean.grad is not None and torch.isfinite(clean.grad).all()
-    assert noise.grad is not None and torch.isfinite(noise.grad).all()
+    assert item["x"].shape == (NUM_CHANNELS, 8, 16, 16, 8)
+    assert float(item["tr"]) == 1.0
+    brain = item["x"][BRAIN, 0] > 0
+    assert (item["x"][DYN][:, ~brain] == 0).all()
 
 
 class SyntheticModule(L.LightningDataModule):
-    """LightningDataModule wrapper for the SyntheticNSDDataset.
-    
-    Handles training/validation spilts and DataLoader instantiation for testing.
-    
-    Args:
-        dataset: The initialized synthetic dataset.
-        batch_size: Number of subjects per batch. Defaults to 1.
-    """
+    """LightningDataModule wrapper for the SyntheticNSDDataset."""
 
     def __init__(self, dataset, batch_size: int = 1) -> None:
-        """Initialize the data module."""
         super().__init__()
         self.dataset = dataset
         self.batch_size = batch_size
 
     def setup(self, stage: str | None = None) -> None:
-        """Split the dataset into an 80/20 train/validation split."""
         total = len(self.dataset)
         val = max(1, int(total * 0.2))
-        train = total - val
-
-        # random_split ensures the network sees different synthetic subjects during validation
-        self.train_set, self.val_set = random_split(self.dataset, [train, val])
+        self.train_set, self.val_set = random_split(self.dataset, [total - val, val])
 
     def train_dataloader(self) -> DataLoader:
-        """Return the training dataloader."""
         return DataLoader(self.train_set, batch_size=self.batch_size)
 
     def val_dataloader(self) -> DataLoader:
-        """Return the validation dataloader."""
         return DataLoader(self.val_set, batch_size=self.batch_size)
 
 
 def test_training_smoke_cpu() -> None:
-    """Run a full forward, backward, and loss computation pass on CPU.
-    
-    This 'smoke test' ensures that the entire Lighning module, Swin Transformer,
-    and dual-engine loss functions compile and execute successfully without
-    requiring a GPU or massive NIfTI files."""
+    """One Lightning fit step (train + validation) of the full model on CPU."""
     ds = SyntheticNSDDataset(n_subjects=4, time_frames=8, shape=(16, 16, 8), seed=2)
     dm = SyntheticModule(ds, batch_size=1)
     dm.setup()
 
-    # embed_dim=96 aligns cleanly with SwiFT num_heads (must be divisible by 3, 6, 12, 24)
-    model = fMRIDenoisingLightning(
-        in_chans=4,
-        patch_size=4,
-        embed_dim=96,
-        mask_ratio=0.5,
-        lr=1e-3
-    )
-
+    model = fMRIDenoisingLightning(patch_size=4, embed_dim=24, mask_ratio=0.5, lr=1e-3, n_comp=2)
     trainer = L.Trainer(
         max_epochs=1,
         accelerator="cpu",
@@ -117,12 +73,30 @@ def test_training_smoke_cpu() -> None:
         logger=False,
         enable_checkpointing=False,
         precision=32,
+        enable_progress_bar=False,
     )
-
-    # If trainer.fit completes without raising an exception (e.g., shape mismatches
-    # or OOM errors), the core pipeline geometry is functionally sound.
-    # Should run without raising
     trainer.fit(model, datamodule=dm)
+    logged = set(trainer.callback_metrics)
+    for name in ("train_total", "train_rec", "train_tissue", "train_band", "train_ortho", "val_total", "val_rec"):
+        assert name in logged, name
+    assert not any(k.endswith(("_fft", "_flat", "_structural_total")) for k in logged)
+
+
+def test_weight_decay_excludes_bias_norm_mask_token_and_relative_bias() -> None:
+    model = fMRIDenoisingLightning(patch_size=4, embed_dim=24)
+    groups = split_weight_decay_groups(model, 0.05)
+    decay_ids = {id(p) for p in groups[0]["params"]}
+    no_decay_ids = {id(p) for p in groups[1]["params"]}
+    assert groups[0]["weight_decay"] == 0.05 and groups[1]["weight_decay"] == 0.0
+    assert decay_ids.isdisjoint(no_decay_ids)
+    assert decay_ids | no_decay_ids == {id(p) for p in model.parameters()}
+    special = ("mask_token", "relative_position_bias_table", "norm")
+    for name, parameter in model.named_parameters():
+        in_no_decay = id(parameter) in no_decay_ids
+        if name.endswith("bias") or any(s in name for s in special):
+            assert in_no_decay, name
+        elif parameter.ndim > 1:
+            assert not in_no_decay, name
 
 
 def test_nsd_split_holds_out_complete_subjects(monkeypatch) -> None:
@@ -141,13 +115,45 @@ def test_nsd_split_holds_out_complete_subjects(monkeypatch) -> None:
     datamodule = NSDDataModule("unused", validation_subjects=["subj03"])
     datamodule.setup()
 
-    train_subjects = {
-        datamodule.full_dataset.entries[index]["subject"]
-        for index in datamodule.train_set.indices
-    }
-    val_subjects = {
-        datamodule.full_dataset.entries[index]["subject"]
-        for index in datamodule.val_set.indices
-    }
+    train_subjects = {datamodule.full_dataset.entries[i]["subject"] for i in datamodule.train_set.indices}
+    val_subjects = {datamodule.full_dataset.entries[i]["subject"] for i in datamodule.val_set.indices}
     assert train_subjects == {"subj01", "subj02"}
     assert val_subjects == {"subj03"}
+    assert datamodule.train_subjects == ["subj01", "subj02"] and datamodule.val_subjects == ["subj03"]
+
+
+def test_cli_rejects_invalid_configuration_and_overlapping_test_subjects() -> None:
+    base = ["--data_dir", "x"]
+    validate_args(parse_args(base))
+    with pytest.raises(ValueError):
+        validate_args(parse_args(base + ["--band_low", "0.2", "--band_high", "0.1"]))
+    with pytest.raises(ValueError):
+        validate_args(parse_args(base + ["--subjects", "subj01", "subj08", "--test_subjects", "subj08"]))
+    with pytest.raises(ValueError):
+        validate_args(parse_args(base + ["--tissue_loss_weight", "-1"]))
+
+
+def test_hparams_json_records_resolved_configuration(tmp_path, monkeypatch) -> None:
+    class FakeNSDDataset:
+        def __init__(self, *args, **kwargs) -> None:
+            self.entries = [{"subject": s, "run": "run1", "tr": 1.0} for s in ("subj01", "subj02", "subj07")]
+
+        def __len__(self) -> int:
+            return len(self.entries)
+
+    monkeypatch.setattr("train_nsd.NSDDataset", FakeNSDDataset)
+    args = parse_args(["--data_dir", "x", "--validation_subjects", "subj07", "--test_subjects", "subj08"])
+    datamodule = NSDDataModule("x", validation_subjects=["subj07"])
+    datamodule.setup()
+    model = fMRIDenoisingLightning(patch_size=4, embed_dim=24)
+
+    record = write_hparams(tmp_path / "hparams.json", args, datamodule, model, {"best_checkpoint": "a.ckpt"})
+    loaded = json.loads((tmp_path / "hparams.json").read_text())
+    assert loaded["split"] == {
+        "train_subjects": ["subj01", "subj02"],
+        "validation_subjects": ["subj07"],
+        "test_subjects": ["subj08"],
+    }
+    assert loaded["args"]["ortho_loss_weight"] == 0.1 and loaded["model_hparams"]["n_comp"] == 3
+    assert loaded["dataset"]["tr_seconds"] == [1.0] and loaded["best_checkpoint"] == "a.ckpt"
+    assert record["software"]["torch"]
