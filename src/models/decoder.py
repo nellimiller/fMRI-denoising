@@ -122,6 +122,9 @@ class CascadingDecoder(nn.Module):
             nn.GELU(),
             nn.Conv3d(16, 1, kernel_size=1),
         )
+        clean_output = self.clean_head[-1]
+        nn.init.normal_(clean_output.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(clean_output.bias)
         self.noise_head = nn.Sequential(
             nn.Conv3d(full_res_channels, 16, kernel_size=3, padding=1),
             nn.GELU(),

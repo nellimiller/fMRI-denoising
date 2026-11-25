@@ -240,9 +240,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Identifiable objective
     parser.add_argument("--rec_loss_weight", type=float, default=1.0)
-    parser.add_argument("--tissue_loss_weight", type=float, default=1.0)
-    parser.add_argument("--band_loss_weight", type=float, default=1.0)
-    parser.add_argument("--ortho_loss_weight", type=float, default=0.1)
+    parser.add_argument("--tissue_loss_weight", type=float, default=0.1)
+    parser.add_argument("--band_loss_weight", type=float, default=0.1)
+    parser.add_argument("--ortho_loss_weight", type=float, default=0.05)
     parser.add_argument("--n_comp", type=int, default=3, help="aCompCor components in the nuisance basis")
     parser.add_argument("--band_low", type=float, default=0.01)
     parser.add_argument("--band_high", type=float, default=0.15)
@@ -258,6 +258,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Ramp tissue/band/ortho loss terms from 0 to full weight over this many steps (0 = off)",
     )
+    parser.add_argument(
+        "--prior_warmup_epochs",
+        type=int,
+        default=2,
+        help="Ramp tissue/band/ortho loss terms from 0 to full weight over this many epochs (0 = off)",
+    )
+    parser.add_argument("--min_clean_var_frac", type=float, default=0.05)
+    parser.add_argument("--w_min_var", type=float, default=1.0)
     parser.add_argument(
         "--early_stopping_patience",
         type=int,
@@ -301,13 +309,16 @@ def validate_args(args: argparse.Namespace) -> None:
         args.tissue_loss_weight,
         args.band_loss_weight,
         args.ortho_loss_weight,
+        args.w_min_var,
     )
     if any(not math.isfinite(weight) or weight < 0 for weight in weights):
         raise ValueError("Loss weights must be finite and non-negative.")
     if not 0 < args.band_low < args.band_high:
         raise ValueError("Require 0 < --band_low < --band_high.")
-    if args.prior_warmup_steps < 0:
-        raise ValueError("--prior_warmup_steps cannot be negative.")
+    if args.prior_warmup_steps < 0 or args.prior_warmup_epochs < 0:
+        raise ValueError("--prior_warmup_steps and --prior_warmup_epochs cannot be negative.")
+    if not math.isfinite(args.min_clean_var_frac) or not 0.0 <= args.min_clean_var_frac <= 1.0:
+        raise ValueError("--min_clean_var_frac must be finite and in [0, 1].")
     if args.n_comp < 0 or args.erosion_iterations < 0:
         raise ValueError("--n_comp and --erosion_iterations cannot be negative.")
     overlap = set(args.test_subjects) & set(args.subjects or [])
@@ -444,6 +455,9 @@ def main(argv: list[str] | None = None) -> None:
         decoder_skips=args.decoder_skips,
         free_noise_head=args.free_noise_head,
         prior_warmup_steps=args.prior_warmup_steps,
+        prior_warmup_epochs=args.prior_warmup_epochs,
+        min_clean_var_frac=args.min_clean_var_frac,
+        w_min_var=args.w_min_var,
         validation_seed=args.seed,
     )
 

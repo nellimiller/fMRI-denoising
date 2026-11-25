@@ -70,6 +70,9 @@ uv run --no-sync python -m src.train_nsd \
     --detrend "$DETREND" \
     --decoder_skips "$TRAIN_DECODER_SKIPS" \
     --prior_warmup_steps "$TRAIN_PRIOR_WARMUP_STEPS" \
+    --prior_warmup_epochs "$TRAIN_PRIOR_WARMUP_EPOCHS" \
+    --min_clean_var_frac "$TRAIN_MIN_CLEAN_VAR_FRAC" \
+    --w_min_var "$TRAIN_W_MIN_VAR" \
     "${ABLATION_ARGS[@]}" \
     --skip_final_eval \
     --run_dir "$RUN_DIR" \

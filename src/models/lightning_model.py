@@ -78,9 +78,9 @@ class fMRIDenoisingLightning(L.LightningModule):
         lr: float = 1.5e-4,
         weight_decay: float = 0.05,
         rec_loss_weight: float = 1.0,
-        tissue_loss_weight: float = 1.0,
-        band_loss_weight: float = 1.0,
-        ortho_loss_weight: float = 0.1,
+        tissue_loss_weight: float = 0.1,
+        band_loss_weight: float = 0.1,
+        ortho_loss_weight: float = 0.05,
         n_comp: int = 3,
         band_low: float = 0.01,
         band_high: float = 0.15,
@@ -90,6 +90,9 @@ class fMRIDenoisingLightning(L.LightningModule):
         decoder_skips: str = "full",
         free_noise_head: bool = False,
         prior_warmup_steps: int = 0,
+        prior_warmup_epochs: int = 2,
+        min_clean_var_frac: float = 0.05,
+        w_min_var: float = 1.0,
         validation_seed: int = 1234,
     ) -> None:
         """Initialize hyperparameters, core model, and loss function."""
@@ -119,6 +122,8 @@ class fMRIDenoisingLightning(L.LightningModule):
             erosion_iterations=self.hparams.erosion_iterations,
             band_low=self.hparams.band_low,
             band_high=self.hparams.band_high,
+            min_clean_var_frac=self.hparams.min_clean_var_frac,
+            w_min_var=self.hparams.w_min_var,
         )
 
     def forward(
@@ -157,11 +162,18 @@ class fMRIDenoisingLightning(L.LightningModule):
         x, tr = batch["x"], batch["tr"]
         out = self(x, tr)
         scale = 1.0
-        warmup = int(self.hparams.prior_warmup_steps)
-        if phase == "train" and warmup > 0:
-            scale = min(1.0, self.global_step / warmup)
+        min_var_scale = 0.0
+        if phase == "train":
+            step_warmup = int(self.hparams.prior_warmup_steps)
+            epoch_warmup = int(self.hparams.prior_warmup_epochs)
+            if step_warmup > 0:
+                scale = min(scale, self.global_step / step_warmup)
+            if epoch_warmup > 0:
+                train_batches = max(1, int(self.trainer.num_training_batches))
+                scale = min(scale, self.global_step / (train_batches * epoch_warmup))
             self.log("prior_scale", scale, batch_size=x.shape[0])
-        losses = self.loss_fn(out, x, tr, prior_scale=scale)
+            min_var_scale = float(self.global_step >= 1)
+        losses = self.loss_fn(out, x, tr, prior_scale=scale, min_var_scale=min_var_scale)
 
         batch_size = x.shape[0]
         for name, value in losses.items():

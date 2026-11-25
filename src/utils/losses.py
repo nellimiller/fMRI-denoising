@@ -61,12 +61,14 @@ class IdentifiableDenoisingLoss(nn.Module):
     def __init__(
         self,
         rec_weight: float = 1.0,
-        tissue_weight: float = 1.0,
-        band_weight: float = 1.0,
-        ortho_weight: float = 0.1,
+        tissue_weight: float = 0.1,
+        band_weight: float = 0.1,
+        ortho_weight: float = 0.05,
         erosion_iterations: int = 1,
         band_low: float = 0.01,
         band_high: float = 0.15,
+        min_clean_var_frac: float = 0.05,
+        w_min_var: float = 1.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -77,6 +79,8 @@ class IdentifiableDenoisingLoss(nn.Module):
         self.erosion_iterations = erosion_iterations
         self.band_low = band_low
         self.band_high = band_high
+        self.min_clean_var_frac = min_clean_var_frac
+        self.w_min_var = w_min_var
         self.eps = eps
 
     def forward(
@@ -85,6 +89,7 @@ class IdentifiableDenoisingLoss(nn.Module):
         x: torch.Tensor,
         tr: torch.Tensor | float = 1.0,
         prior_scale: float = 1.0,
+        min_var_scale: float = 1.0,
     ) -> dict[str, torch.Tensor]:
         """Compute all loss terms.
 
@@ -95,6 +100,7 @@ class IdentifiableDenoisingLoss(nn.Module):
             tr: Repetition time(s) in seconds.
             prior_scale: Multiplier in ``[0, 1]`` on the three prior terms (tissue, band,
                 ortho) for warm-up; ``rec`` is never scaled. ``1`` is the specified objective.
+            min_var_scale: Multiplier used to activate the GM clean-variance floor.
 
         Returns:
             Dict with ``total``, ``rec``, ``tissue``, ``band``, ``ortho`` and detached
@@ -145,14 +151,21 @@ class IdentifiableDenoisingLoss(nn.Module):
         weight = gm.float() * active  # [B,J,X,Y,Z]
         ortho = _masked_mean(rho_sq, weight)
 
-        total = self.rec_weight * rec + prior_scale * (
+        region = (gm & out["voxel_mask"]).float().unsqueeze(2)
+        centered_target = target - target.mean(2, keepdim=True)
+        target_var = _masked_mean(centered_target.square(), region, T)
+        centered_clean = clean - clean.mean(2, keepdim=True)
+        clean_var = _masked_mean(centered_clean.square(), region, T)
+        clean_var_frac = clean_var / target_var.clamp_min(self.eps)
+        min_var = self.w_min_var * torch.relu(
+            self.min_clean_var_frac - clean_var_frac
+        ).square()
+
+        total = self.rec_weight * rec + min_var_scale * min_var + prior_scale * (
             self.tissue_weight * tissue + self.band_weight * band + self.ortho_weight * ortho
         )
 
         with torch.no_grad():
-            region = (gm & out["voxel_mask"]).float().unsqueeze(2)
-            target_var = _masked_mean((target - target.mean(2, keepdim=True)).square(), region, T)
-
             def share(signal: torch.Tensor) -> torch.Tensor:
                 centered_signal = signal - signal.mean(2, keepdim=True)
                 return _masked_mean(centered_signal.square(), region, T) / target_var.clamp_min(self.eps)
@@ -169,5 +182,6 @@ class IdentifiableDenoisingLoss(nn.Module):
             "tissue": tissue,
             "band": band,
             "ortho": ortho,
+            "min_var": min_var,
             **diagnostics,
         }
