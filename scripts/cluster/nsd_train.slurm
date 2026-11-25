@@ -50,7 +50,14 @@ if [[ "$EARLY_STOPPING_PATIENCE" -gt 0 ]]; then
 fi
 RESUME_ARGS=()
 if [[ -n "$RESUME_CHECKPOINT" ]]; then
-    RESUME_ARGS=(--resume_checkpoint "$RESUME_CHECKPOINT")
+    RESUME_ARGS=(--resume --resume_checkpoint "$RESUME_CHECKPOINT")
+fi
+WANDB_ARGS=()
+if [[ "$USE_WANDB" == "1" ]]; then
+    WANDB_ARGS+=(--wandb --wandb-project "$WANDB_PROJECT" --wandb-mode "$WANDB_MODE")
+    if [[ -n "$WANDB_ENTITY" ]]; then
+        WANDB_ARGS+=(--wandb-entity "$WANDB_ENTITY")
+    fi
 fi
 
 uv run --no-sync python -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"; print(f"GPU: {torch.cuda.get_device_name(0)}")'
@@ -97,5 +104,5 @@ uv run --no-sync python -m src.train_nsd \
     --log_dir "$LOG_DIR" \
     --visualization_dir "$VIS_DIR" \
     --eval_dir "$EVAL_DIR" \
-    --project "$WANDB_PROJECT" \
+    "${WANDB_ARGS[@]}" \
     --name "$RUN_ID"

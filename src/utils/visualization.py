@@ -153,5 +153,23 @@ class ValidationVisualizationCallback(Callback):
             f"epoch={trainer.current_epoch} time={time_index} z={spatial_slice} K={self.K}"
         )
         figure.tight_layout()
-        figure.savefig(self.output_dir / f"validation_epoch_{trainer.current_epoch:04d}.png", dpi=120)
+        output_path = (
+            self.output_dir
+            / f"validation_ep{trainer.current_epoch:03d}_step{trainer.global_step:06d}.png"
+        )
+        figure.savefig(output_path, dpi=120)
         plt.close(figure)
+        for logger in trainer.loggers:
+            if logger.__class__.__name__ != "WandbLogger":
+                continue
+            import wandb
+
+            logger.experiment.log(
+                {
+                    "validation/panel": wandb.Image(
+                        str(output_path),
+                        caption=f"epoch={trainer.current_epoch}, step={trainer.global_step}",
+                    )
+                },
+                step=trainer.global_step,
+            )

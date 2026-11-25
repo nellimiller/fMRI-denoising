@@ -39,6 +39,13 @@ fi
 ABLATION_ARGS=()
 [[ "$TRAIN_FREE_NOISE_HEAD" == "1" ]] && ABLATION_ARGS+=(--free_noise_head)
 [[ "$TRAIN_SOFT_BANDPASS" == "1" ]] && ABLATION_ARGS+=(--soft_bandpass)
+WANDB_ARGS=()
+if [[ "$USE_WANDB" == "1" ]]; then
+    WANDB_ARGS+=(--wandb --wandb-project "$WANDB_PROJECT" --wandb-mode "$WANDB_MODE")
+    if [[ -n "$WANDB_ENTITY" ]]; then
+        WANDB_ARGS+=(--wandb-entity "$WANDB_ENTITY")
+    fi
+fi
 
 uv run --no-sync python -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"; print(f"GPU: {torch.cuda.get_device_name(0)}")'
 
@@ -79,5 +86,5 @@ uv run --no-sync python -m src.train_nsd \
     --checkpoint_dir "$CKPT_DIR" \
     --log_dir "$LOG_DIR" \
     --visualization_dir "$VIS_DIR" \
-    --project "$WANDB_PROJECT" \
+    "${WANDB_ARGS[@]}" \
     --name "$RUN_ID"

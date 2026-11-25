@@ -281,13 +281,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval_dir", default=None, help="Default: <checkpoint_dir>/final_evaluation")
 
     # Logging & Checkpointing params
-    parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--project", default="7T-fMRI-Denoising")
+    parser.add_argument("--use_wandb", "--wandb", action="store_true", dest="use_wandb")
+    parser.add_argument("--project", "--wandb-project", dest="wandb_project", default="7T-fMRI-Denoising")
+    parser.add_argument("--wandb-entity", default="")
+    parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--name", default="SwinMAE-NSD")
     parser.add_argument("--log_dir", default="logs_nsd")
     parser.add_argument("--checkpoint_dir", default="checkpoints_nsd")
     parser.add_argument("--run_dir", default=None, help="Run root containing epoch_metrics.csv")
-    parser.add_argument("--resume_checkpoint", default=None, help="Lightning checkpoint to resume from")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Explicitly resume; defaults to <checkpoint_dir>/last.ckpt",
+    )
+    parser.add_argument(
+        "--resume_checkpoint",
+        default=None,
+        help="Optional checkpoint override; only used together with --resume",
+    )
     parser.add_argument("--visualization_dir", default="validation_visualizations")
     parser.add_argument("--visualize_every_n_epochs", type=int, default=1)
 
@@ -464,12 +475,23 @@ def main(argv: list[str] | None = None) -> None:
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     hparams_path = checkpoint_dir / "hparams.json"
-    write_hparams(hparams_path, args, datamodule, model)
+    hparams = write_hparams(hparams_path, args, datamodule, model)
     print(f"Wrote resolved hyperparameters to {hparams_path}")
 
+    run_dir = Path(args.run_dir) if args.run_dir else checkpoint_dir.parent
     loggers = [CSVLogger(save_dir=str(log_dir), name=args.name)]
     if args.use_wandb:
-        loggers.append(WandbLogger(project=args.project, name=args.name))
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=args.name,
+            id=args.name,
+            resume="allow",
+            save_dir=str(run_dir),
+            mode=args.wandb_mode,
+        )
+        wandb_logger.log_hyperparams(hparams)
+        loggers.append(wandb_logger)
 
     best_checkpoint_callback = ModelCheckpoint(
         monitor="val/total",
@@ -486,7 +508,6 @@ def main(argv: list[str] | None = None) -> None:
         every_n_epochs=5,
         save_on_train_epoch_end=True,
     )
-    run_dir = Path(args.run_dir) if args.run_dir else checkpoint_dir.parent
     visualization_callback = ValidationVisualizationCallback(
         output_dir=args.visualization_dir,
         every_n_epochs=args.visualize_every_n_epochs,
@@ -513,6 +534,8 @@ def main(argv: list[str] | None = None) -> None:
 
     trainer = L.Trainer(
         max_epochs=args.epochs,
+        max_steps=-1,
+        val_check_interval=1.0,
         logger=loggers,
         callbacks=callbacks,
         accelerator="auto",
@@ -524,11 +547,12 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     print("Starting training...")
-    trainer.fit(
-        model,
-        datamodule=datamodule,
-        ckpt_path=str(Path(args.resume_checkpoint).expanduser()) if args.resume_checkpoint else None,
-    )
+    resume_path = None
+    if args.resume:
+        resume_path = Path(args.resume_checkpoint or checkpoint_dir / "last.ckpt").expanduser()
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Cannot resume: checkpoint does not exist: {resume_path}")
+    trainer.fit(model, datamodule=datamodule, ckpt_path=str(resume_path) if resume_path else None)
 
     if not trainer.is_global_zero:
         return
