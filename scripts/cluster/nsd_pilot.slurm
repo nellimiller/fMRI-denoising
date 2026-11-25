@@ -6,8 +6,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:nvidia_a100_80gb_pcie:1
 
 set -euo pipefail
 
@@ -15,6 +16,7 @@ REPO_DIR="${SLURM_SUBMIT_DIR:?Submit this job from the repository root}"
 cd "$REPO_DIR"
 source "$REPO_DIR/scripts/cluster/pipeline.env"
 export PATH="$HOME/.local/bin:$PATH"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 mkdir -p "$RUN_DIR" "$CKPT_DIR" "$EVAL_DIR" "$SLURM_LOG_DIR" "$LOG_DIR" "$VIS_DIR"
 cp "$REPO_DIR/scripts/cluster/pipeline.env" "$RUN_DIR/pipeline.env"
