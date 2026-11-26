@@ -99,13 +99,24 @@ def nuisance_regressors(
         variance = centered.square().sum(dim=1, keepdim=True) / T  # (B, 1, V)
         scale = torch.where(variance > eps, variance.sqrt().reciprocal(), torch.zeros_like(variance))
         normalised = centered * scale  # voxels without variance drop out
-        gram = (normalised @ normalised.transpose(1, 2)).double()  # (B, T, T)
-        values, vectors = torch.linalg.eigh(gram)  # ascending
-        values, vectors = values.float(), vectors.float()
         k = min(n_comp, T - 1)
-        top_values = values[:, -k:].flip(-1)  # (B, k)
-        top_vectors = vectors[:, :, -k:].flip(-1)  # (B, T, k)
-        components = top_vectors * top_values.clamp_min(0).sqrt().unsqueeze(1)
+        gram = (normalised @ normalised.transpose(1, 2)).double()
+        try:
+            values, vectors = torch.linalg.eigh(gram)
+            values, vectors = values.float(), vectors.float()
+            top_values = values[:, -k:].flip(-1)
+            top_vectors = vectors[:, :, -k:].flip(-1)
+            components = top_vectors * top_values.clamp_min(0).sqrt().unsqueeze(1)
+        except torch.linalg.LinAlgError:
+            # SVD avoids squaring the condition number when repeated/near-zero
+            # eigenvalues prevent LAPACK from converging on the Gram matrix.
+            vectors, singular_values, _ = torch.linalg.svd(
+                normalised.double(), full_matrices=False
+            )
+            components = (
+                vectors.float()[:, :, :k]
+                * singular_values.float()[:, :k].unsqueeze(1)
+            )
         for index in range(k):
             traces.append(components[:, :, index])
         for _ in range(n_comp - k):
